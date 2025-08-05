@@ -1,0 +1,8 @@
+torch>=2.2
+transformers>=4.40
+datasets
+evaluate
+scikit-learn
+pandas
+wandb
+peft

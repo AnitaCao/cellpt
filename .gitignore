@@ -1,0 +1,22 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+env/
+venv/
+
+# Data and model outputs
+outputs/
+*.bin
+*.npz
+*.arrow
+*.pth
+
+# W&B cache
+wandb/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
