@@ -13,6 +13,7 @@ from transformers import (
 )
 import evaluate
 from sklearn.metrics import f1_score
+from torch.utils.data import DataLoader
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Frozen-backbone linear probe for DINOv2")
@@ -22,7 +23,7 @@ def parse_args():
     parser.add_argument("--learning_rate", type=float, default=1e-3)  # higher LR for head-only training
     parser.add_argument("--train_batch_size", type=int, default=64)
     parser.add_argument("--eval_batch_size", type=int, default=64)
-    parser.add_argument("--num_train_epochs", type=int, default=5)
+    parser.add_argument("--num_train_epochs", type=int, default=10)
     parser.add_argument("--eval_steps", type=int, default=500)
     parser.add_argument("--logging_steps", type=int, default=100)
     return parser.parse_args()
@@ -34,11 +35,9 @@ def main():
     run_output_dir = os.path.join(args.output_dir, f"dinov2_frozen_head_{timestamp}")
     os.makedirs(run_output_dir, exist_ok=True)
 
-    # Load dataset
     raw_datasets = load_from_disk(args.dataset_path)
     assert isinstance(raw_datasets, DatasetDict)
 
-    # Processor & transforms
     processor = AutoImageProcessor.from_pretrained("facebook/dinov2-base")
     train_tf = v2.Compose([
         v2.RandomHorizontalFlip(),
@@ -46,28 +45,29 @@ def main():
         v2.RandomRotation(180),
     ])
 
-    def train_transform(examples):
-        images = examples["image"]
+    # On‑the‑fly collation instead of .map()
+    def collate_fn_train(batch):
         pixel_values = [
-            processor(train_tf(img), return_tensors="pt")["pixel_values"].squeeze(0)
-            for img in images
+            processor(train_tf(item["image"]), return_tensors="pt")["pixel_values"].squeeze(0)
+            for item in batch
         ]
-        return {"pixel_values": pixel_values}
+        labels = [item["label"] for item in batch]
+        return {
+            "pixel_values": torch.stack(pixel_values),
+            "labels": torch.tensor(labels)
+        }
 
-    def val_transform(examples):
-        images = examples["image"]
+    def collate_fn_eval(batch):
         pixel_values = [
-            processor(img, return_tensors="pt")["pixel_values"].squeeze(0)
-            for img in images
+            processor(item["image"], return_tensors="pt")["pixel_values"].squeeze(0)
+            for item in batch
         ]
-        return {"pixel_values": pixel_values}
+        labels = [item["label"] for item in batch]
+        return {
+            "pixel_values": torch.stack(pixel_values),
+            "labels": torch.tensor(labels)
+        }
 
-    # Apply transforms offline with map()
-    train_ds = raw_datasets["train"].rename_column("label", "labels").map(train_transform, batched=True)
-    val_ds = raw_datasets["validation"].rename_column("label", "labels").map(val_transform, batched=True)
-    test_ds = raw_datasets["test"].rename_column("label", "labels").map(val_transform, batched=True)
-
-    # Load model and freeze backbone
     model = Dinov2ForImageClassification.from_pretrained(
         "facebook/dinov2-base",
         num_labels=args.num_labels,
@@ -77,7 +77,6 @@ def main():
         if "classifier" not in name:
             param.requires_grad = False
 
-    # Metrics
     acc_metric = evaluate.load("accuracy")
     def compute_metrics(eval_pred):
         preds = np.argmax(eval_pred.predictions, axis=1)
@@ -86,14 +85,13 @@ def main():
         macro_f1 = f1_score(labels, preds, average="macro")
         return {"accuracy": acc, "macro_f1": macro_f1}
 
-    # Training args
     training_args = TrainingArguments(
         output_dir=run_output_dir,
         learning_rate=args.learning_rate,
         per_device_train_batch_size=args.train_batch_size,
         per_device_eval_batch_size=args.eval_batch_size,
         num_train_epochs=args.num_train_epochs,
-        evaluation_strategy="steps",
+        eval_strategy="steps",
         eval_steps=args.eval_steps,
         logging_steps=args.logging_steps,
         load_best_model_at_end=True,
@@ -102,22 +100,31 @@ def main():
         save_total_limit=1,
         bf16=torch.cuda.is_bf16_supported(),
         report_to="none",
-        remove_unused_columns=False  # ensures pixel_values stays
+        remove_unused_columns=False
     )
 
-    # Trainer
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=train_ds,
-        eval_dataset=val_ds,
-        compute_metrics=compute_metrics
+        train_dataset=raw_datasets["train"],
+        eval_dataset=raw_datasets["validation"],
+        compute_metrics=compute_metrics,
+        data_collator=collate_fn_train  # will be overridden for eval below
+    )
+
+    # Patch eval collator
+    trainer.get_eval_dataloader = lambda eval_dataset=None: DataLoader(
+        eval_dataset if eval_dataset is not None else trainer.eval_dataset,
+        batch_size=args.eval_batch_size,
+        shuffle=False,
+        collate_fn=collate_fn_eval
     )
 
     trainer.train()
 
-    # Test set evaluation
-    test_metrics = trainer.evaluate(test_ds)
+    test_metrics = trainer.evaluate(
+        DataLoader(raw_datasets["test"], batch_size=args.eval_batch_size, collate_fn=collate_fn_eval)
+    )
     print("Test metrics:", test_metrics)
 
 if __name__ == "__main__":

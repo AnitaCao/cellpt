@@ -62,8 +62,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, required=True,
                         help="Model name or path (e.g., openai/clip-vit-base-patch32, facebook/dinov2-base, or local fine-tuned checkpoint)")
-    parser.add_argument("--dataset_path", default="/home/tcvcs/Projects/datasets/CellImageNet/test" type=str, required=True,
-                        help="Path to dataset split folder (train/validation/test)")
+    parser.add_argument("--dataset_path", default="/home/tcvcs/Projects/datasets/CellImageNet/test", type=str, help="Path to dataset split folder (train/validation/test)")
     parser.add_argument("--output_dir", type=str, required=True,
                         help="Directory to save extracted features")
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size for feature extraction")

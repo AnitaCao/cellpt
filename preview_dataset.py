@@ -1,7 +1,6 @@
 from datasets import load_from_disk
 
 import matplotlib.pyplot as plt
-%matplotlib inline
 import random
 
 # Path to your dataset split (train, validation, or test)

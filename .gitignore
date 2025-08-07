@@ -20,3 +20,5 @@ wandb/
 
 # Jupyter checkpoints
 .ipynb_checkpoints/
+
+*.log

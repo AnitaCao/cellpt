@@ -1,0 +1,57 @@
+nohup: ignoring input
+/home/tcvcs/miniconda3/envs/cellpt/lib/python3.10/site-packages/requests/__init__.py:86: RequestsDependencyWarning: Unable to find acceptable character detection dependency (chardet or charset_normalizer).
+  warnings.warn(
+Trainable parameters: 1060645
+Training:   0%|          | 0/341314 [00:00<?, ?it/s]Training:   0%|          | 0/341314 [00:02<?, ?it/s]
+Traceback (most recent call last):
+  File "/home/tcvcs/Projects/CellPT/train_lora.py", line 113, in <module>
+    main()
+  File "/home/tcvcs/Projects/CellPT/train_lora.py", line 95, in main
+    train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
+  File "/home/tcvcs/Projects/CellPT/train_lora.py", line 57, in train_one_epoch
+    outputs = model(imgs)
+  File "/home/tcvcs/miniconda3/envs/cellpt/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/tcvcs/miniconda3/envs/cellpt/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/tcvcs/Projects/CellPT/model/dinov2_model.py", line 28, in forward
+    features = self.backbone(x)
+  File "/home/tcvcs/miniconda3/envs/cellpt/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/tcvcs/miniconda3/envs/cellpt/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/tcvcs/Projects/CellPT/model/dinov2_model.py", line 17, in forward
+    outputs = self.model(pixel_values=x)
+  File "/home/tcvcs/miniconda3/envs/cellpt/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/tcvcs/miniconda3/envs/cellpt/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/tcvcs/miniconda3/envs/cellpt/lib/python3.10/site-packages/transformers/models/dinov2/modeling_dinov2.py", line 594, in forward
+    encoder_outputs = self.encoder(
+  File "/home/tcvcs/miniconda3/envs/cellpt/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/tcvcs/miniconda3/envs/cellpt/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/tcvcs/miniconda3/envs/cellpt/lib/python3.10/site-packages/transformers/models/dinov2/modeling_dinov2.py", line 473, in forward
+    layer_outputs = layer_module(hidden_states, layer_head_mask, output_attentions)
+  File "/home/tcvcs/miniconda3/envs/cellpt/lib/python3.10/site-packages/transformers/modeling_layers.py", line 94, in __call__
+    return super().__call__(*args, **kwargs)
+  File "/home/tcvcs/miniconda3/envs/cellpt/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/tcvcs/miniconda3/envs/cellpt/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/tcvcs/miniconda3/envs/cellpt/lib/python3.10/site-packages/transformers/models/dinov2/modeling_dinov2.py", line 437, in forward
+    layer_output = self.mlp(layer_output)
+  File "/home/tcvcs/miniconda3/envs/cellpt/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/tcvcs/miniconda3/envs/cellpt/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/tcvcs/miniconda3/envs/cellpt/lib/python3.10/site-packages/transformers/models/dinov2/modeling_dinov2.py", line 374, in forward
+    hidden_state = self.fc1(hidden_state)
+  File "/home/tcvcs/miniconda3/envs/cellpt/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/tcvcs/miniconda3/envs/cellpt/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/tcvcs/Projects/CellPT/model/lora.py", line 33, in forward
+    return F.linear(x, self.weight, self.bias) + self.scaling * self.lora_up(self.lora_down(x))
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 98.00 MiB. GPU 0 has a total capacity of 15.61 GiB of which 29.56 MiB is free. Process 353725 has 2.01 GiB memory in use. Process 380060 has 2.44 GiB memory in use. Process 403834 has 1.97 GiB memory in use. Process 1333577 has 2.01 GiB memory in use. Process 2708024 has 5.66 GiB memory in use. Including non-PyTorch memory, this process has 1.43 GiB memory in use. Of the allocated memory 1.16 GiB is allocated by PyTorch, and 80.43 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
