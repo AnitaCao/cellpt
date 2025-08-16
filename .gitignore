@@ -24,3 +24,11 @@ wandb/
 *.log
 logs/
 outputs/
+
+#data folders
+nucleus_data/
+slurm_submission/
+data/*/
+experiments/
+utils/*.png
+utils/*.csv
