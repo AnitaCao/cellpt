@@ -5,7 +5,7 @@ import pandas as pd
 import numpy as np
 
 def choose_meta(slide_dir: Path, prefer_uniform: bool) -> Path:
-    m_uniform = slide_dir / "meta" / "nucleus_shapes_uniform.csv"
+    m_uniform = slide_dir / "meta" / "nucleus_shapes_uniform_3x.csv"
     m_orig    = slide_dir / "meta" / "nucleus_shapes.csv"
     if prefer_uniform and m_uniform.is_file():
         return m_uniform
@@ -16,9 +16,16 @@ def choose_meta(slide_dir: Path, prefer_uniform: bool) -> Path:
     raise FileNotFoundError(f"No meta CSV found in {slide_dir} (checked {m_orig.name} and {m_uniform.name})")
 
 def pick_img_col(df: pd.DataFrame, prefer_uniform: bool) -> str:
-    if prefer_uniform and "img_path_uniform" in df.columns:
-        return "img_path_uniform"
-    return "img_path" if "img_path" in df.columns else "img_path_uniform"
+    if prefer_uniform:
+        if "img_path_uniform" in df.columns:  
+            return "img_path_uniform"
+        else:
+            raise RuntimeError("CSV must contain 'img_path_uniform' column when prefer_uniform=True.")  
+    if "img_path" in df.columns:      
+        return "img_path"
+    else:
+        raise RuntimeError("CSV must contain either 'img_path' or 'img_path_uniform' column.")
+  
 
 def load_one(slide_root: Path, slide_name: str, prefer_uniform: bool, include_unknown: bool) -> pd.DataFrame:
     sdir = slide_root / slide_name

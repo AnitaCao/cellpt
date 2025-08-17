@@ -1,7 +1,7 @@
 {
-    "train_csv": "/hpc/group/jilab/rz179/cellpt/combined/combined_meta_original_selected_train.csv",
-    "val_csv": "/hpc/group/jilab/rz179/cellpt/combined/combined_meta_original_selected_val.csv",
-    "class_map": "/hpc/group/jilab/rz179/cellpt/combined/class_to_idx.json",
+    "train_csv": "/hpc/group/jilab/rz179/cellpt/combined/combined_meta_original_selected_7s_train.csv",
+    "val_csv": "/hpc/group/jilab/rz179/cellpt/combined/combined_meta_original_selected_7s_val.csv",
+    "class_map": "/hpc/group/jilab/rz179/cellpt/combined/class_to_idx_original_selected_7s.json",
   
     "out_dir": "/hpc/group/jilab/rz179/cellpt/experiments/dinov2_lora_original",
     "model": "vit_base_patch14_dinov2",

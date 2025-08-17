@@ -25,6 +25,8 @@ from utils.utils import (
 )
 from model.lora import apply_lora_to_timm_vit
 
+from datetime import timedelta
+
 
 # -----------------------------
 # DDP helpers
@@ -32,7 +34,7 @@ from model.lora import apply_lora_to_timm_vit
 def setup_ddp():
     """Initialize process group if torchrun provided env vars. Returns (is_ddp, local_rank, world_size, global_rank)."""
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        dist.init_process_group(backend="nccl", init_method="env://")
+        dist.init_process_group(backend="nccl", init_method="env://", timeout=timedelta(minutes=30))
         world_size = dist.get_world_size()
         global_rank = dist.get_rank()
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -56,24 +58,8 @@ def ddp_allreduce_counts(counts: np.ndarray, device) -> np.ndarray:
     t = torch.tensor(counts, dtype=torch.int64, device=device)
     if dist.is_initialized():
         dist.all_reduce(t, op=dist.ReduceOp.SUM)
-    return t.cpu().numpy()
-
-
-# -----------------------------
-# Val prediction histogram (DDP aware)
-# -----------------------------
-def per_class_counts_ddp(val_loader, model, device, num_classes):
-    model.eval()
-    local = np.zeros(num_classes, dtype=np.int64)
-    with torch.inference_mode(), torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
-        for x, _ in val_loader:
-            x = x.to(device, non_blocking=True)
-            logits = model(x)
-            preds = logits.argmax(1).cpu().numpy()
-            for p in preds:
-                local[p] += 1
-    return local  # caller will allreduce
-
+    t = t.round().clamp_min_(0)              # safety: no negatives after sum
+    return t.to(torch.int64).cpu().numpy()
 
 # -----------------------------
 # Main
@@ -81,6 +67,8 @@ def per_class_counts_ddp(val_loader, model, device, num_classes):
 def main():
     args = parse_args(add_lora_args)
     set_seed(args.seed)
+    torch.set_float32_matmul_precision("high")
+    
     os.makedirs(args.out_dir, exist_ok=True)
 
     # ---- DDP init ----
@@ -102,7 +90,7 @@ def main():
         print(f"Classes ({num_classes}): {classes}")
 
     # ---- Build model (timm DINOv2 ViT by default) ----
-    model = timm.create_model(args.model, pretrained=True, num_classes=num_classes)
+    model = timm.create_model(args.model, pretrained=True, num_classes=num_classes, img_size=args.img_size)
 
     # Get normalization from model cfg (fallback to ImageNet defaults)
     mean = tuple(model.pretrained_cfg.get('mean', IMAGENET_DEFAULT_MEAN))
@@ -132,12 +120,12 @@ def main():
 
     # ---- Datasets ----
     train_ds = NucleusCSV(
-        args.train_csv, class_to_idx,mean=mean, std=std,
+        args.train_csv, class_to_idx, size=args.img_size, mean=mean, std=std,
         use_img_uniform=args.use_img_uniform,
         augment=True
     )
     val_ds = NucleusCSV(
-        args.val_csv, class_to_idx, mean=mean, std=std,
+        args.val_csv, class_to_idx, size=args.img_size, mean=mean, std=std,
         use_img_uniform=args.use_img_uniform,
         augment=False
     )
@@ -146,55 +134,54 @@ def main():
         print(f"Train samples: {len(train_ds)}")
         print(f"Val samples:   {len(val_ds)}")
 
-    # ---- Samplers & Loaders ----
-    # If DDP, always use DistributedSampler. If single GPU and args.sampler == "weighted", use WeightedRandomSampler.
+
+    # Sampler / loaders
     pw = args.num_workers > 0
-
     if is_ddp:
-        train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=global_rank, shuffle=True, drop_last=False)
-        val_sampler   = DistributedSampler(val_ds,   num_replicas=world_size, rank=global_rank, shuffle=False, drop_last=False)
-        train_loader = DataLoader(
-            train_ds, batch_size=args.batch_size, sampler=train_sampler,
-            num_workers=args.num_workers, pin_memory=True,
-            persistent_workers=pw, prefetch_factor=4 if pw else None
-        )
-    else:
+        # override any weighted sampler in DDP
         if args.sampler == "weighted":
-            # Build weights from the filtered dataframe inside the dataset
-            tdf = train_ds.df
-            sampler = make_weighted_sampler(tdf, "cell_type")
-            train_loader = DataLoader(
-                train_ds, batch_size=args.batch_size, sampler=sampler,
-                num_workers=args.num_workers, pin_memory=True,
-                persistent_workers=pw, prefetch_factor=4 if pw else None
-            )
-        else:
-            train_loader = DataLoader(
-                train_ds, batch_size=args.batch_size, shuffle=True,
-                num_workers=args.num_workers, pin_memory=True,
-                persistent_workers=pw, prefetch_factor=4 if pw else None
-            )
-        val_sampler = None  # single GPU
-    val_loader = DataLoader(
-        val_ds, batch_size=args.batch_size, shuffle=False, sampler=val_sampler,
-        num_workers=max(1, args.num_workers // 2), pin_memory=True,
-        persistent_workers=pw
-    )
+            print("DDP detected: overriding sampler=weighted -> DistributedSampler + class-weighted CE")
+        train_sampler = DistributedSampler(train_ds, shuffle=True, drop_last=True)
+        val_sampler   = DistributedSampler(val_ds,   shuffle=False, drop_last=False)
+        shuffle_train = False
+    else:
+        train_sampler = None
+        val_sampler   = None
+        shuffle_train = (args.sampler != "weighted")
 
-    # ---- Loss ----
-    # If we aren't using a WeightedRandomSampler (i.e., DDP or plain shuffle),
-    # use class-weighted CE based on the training distribution to mitigate imbalance.
-    cls_weights = None
-    use_class_weights = (is_ddp or args.sampler != "weighted")
-    if use_class_weights:
+    if is_ddp or args.sampler != "weighted":
+        # standard loaders
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=shuffle_train,
+                                sampler=train_sampler, num_workers=args.num_workers,
+                                pin_memory=True, persistent_workers=pw)
+    else:
+        # single-GPU weighted sampler path (unchanged)
+        tdf = pd.read_csv(args.train_csv)
+        col = "img_path_uniform" if args.use_img_uniform and "img_path_uniform" in tdf.columns else "img_path"
+        tdf = tdf[(tdf[col].map(lambda p: Path(str(p)).is_file())) & (tdf["skipped_reason"].fillna("") == "")]
+        tdf = tdf[tdf["cell_type"].isin(class_to_idx.keys())]
+        sampler = make_weighted_sampler(tdf, "cell_type")
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=sampler,
+                                num_workers=args.num_workers, pin_memory=True, persistent_workers=pw)
+
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
+                            sampler=val_sampler, num_workers=args.num_workers,
+                            pin_memory=True, persistent_workers=pw)
+
+    # ---- Loss: class-weighted CE if we overrode weighted sampler ----
+    if is_ddp or args.sampler != "weighted":
+        # counts per class from the actual train dataset view we use
         counts = train_ds.df["cell_type"].value_counts()
-        weights = np.zeros(len(classes), dtype=np.float32)
-        for i, c in enumerate(classes):
-            weights[i] = 1.0 / max(1, counts.get(c, 0))
-        # normalize to sum=1 is optional; CE only needs relative scaling
-        cls_weights = torch.tensor(weights, dtype=torch.float32, device=device)
-    criterion = nn.CrossEntropyLoss(weight=cls_weights)
-
+        weights = []
+        for cls in classes:
+            w = 1.0 / max(1, counts.get(cls, 0))
+            weights.append(w)
+        w = torch.tensor(weights, dtype=torch.float)
+        w = w * (len(w) / w.sum())   # normalize around 1.0
+        criterion = nn.CrossEntropyLoss(weight=w.to(device))
+    else:
+        criterion = nn.CrossEntropyLoss()
+        
     # ---- Optimizer & Schedule ----
     # Two groups: LoRA params vs head params
     # NOTE: if model is DDP, need to access .module to count head params (already frozen/unfrozen)
@@ -228,7 +215,8 @@ def main():
     else:
         scheduler = None
 
-    scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
+    scaler = torch.amp.GradScaler('cuda', enabled=torch.cuda.is_available())
+
 
     # Save the used class map (rank 0)
     if is_main_process():
@@ -250,6 +238,8 @@ def main():
         print(f"LoRA on last {args.lora_blocks} blocks | rank={args.lora_rank} alpha={args.lora_alpha} dropout={args.lora_dropout}")
         print(f"LRs: head={args.lr_head}  lora={args.lr_lora}  | cosine={args.cosine} warmup={args.warmup_epochs}\n")
 
+    params_to_clip = [p for g in optimizer.param_groups for p in g['params'] if p.requires_grad]
+    
     # ---- Train loop ----
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
@@ -263,13 +253,13 @@ def main():
         train_loss_sum = 0.0
         train_correct = 0
         train_total = 0
-
+        
         for x, y in train_loader:
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+            with torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):
                 logits = model(x)
                 loss = criterion(logits, y)
 
@@ -277,9 +267,6 @@ def main():
 
             # gradient clipping
             scaler.unscale_(optimizer)
-            params_to_clip = []
-            for g in optimizer.param_groups:
-                params_to_clip += [p for p in g["params"] if p.requires_grad]
             torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm=1.0)
 
             scaler.step(optimizer)
@@ -305,7 +292,7 @@ def main():
         val_total = 0
         val_loss_sum = 0.0
 
-        with torch.inference_mode(), torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+        with torch.inference_mode(), torch.amp.autocast('cuda',enabled=torch.cuda.is_available()):
             for x, y in val_loader:
                 x = x.to(device, non_blocking=True)
                 y = y.to(device, non_blocking=True)
@@ -339,27 +326,38 @@ def main():
             log_metrics(metrics_w, run_id, epoch, train_loss, train_acc, val_loss, val_acc, lr_head, lr_lora, secs)
             metrics_f.flush()
 
-            # Optional: prediction breakdown every 5 epochs (DDP-aware)
-            if epoch == 1 or epoch % 5 == 0:
-                local_counts = per_class_counts_ddp(val_loader, model, device, num_classes)
-                counts = ddp_allreduce_counts(local_counts, device)
+        # ---- DDP-safe prediction breakdown (every 5 epochs incl. 1) ----
+        if (epoch == 1 or epoch % 5 == 0):
+            # EVERY rank computes local counts and participates in the all-reduce
+            raw_model.eval()
+            local_counts = np.zeros(num_classes, dtype=np.int64)
+            with torch.inference_mode(), torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):
+                for x, _ in val_loader:
+                    x = x.to(device, non_blocking=True)
+                    logits = model(x)
+                    preds = logits.argmax(1).cpu().numpy()
+                    for p in preds:
+                        local_counts[p] += 1
+            counts = ddp_allreduce_counts(local_counts, device)
+            
+            if is_main_process():
                 total_preds = counts.sum()
                 print("  Val prediction breakdown (all ranks):")
                 for i, cls in enumerate(classes):
                     frac = (counts[i] / max(1, total_preds)) * 100.0
                     print(f"    {cls}: {counts[i]} ({frac:.1f}%)")
 
-            # Save best
-            if val_acc > best_acc:
-                best_acc = val_acc
-                to_save = raw_model.state_dict()
-                torch.save({
-                    "model": to_save,
-                    "args": vars(args),
-                    "classes": classes,
-                    "val_acc": best_acc,
-                }, best_path)
-                print(f"  ✓ Saved new best to {best_path}")
+        # Save best
+        if is_main_process() and (val_acc > best_acc):
+            best_acc = val_acc
+            to_save = raw_model.state_dict()
+            torch.save({
+                "model": to_save,
+                "args": vars(args),
+                "classes": classes,
+                "val_acc": best_acc,
+            }, best_path)
+            print(f"  ✓ Saved new best to {best_path}")
 
     if is_main_process():
         if 'metrics_f' in locals() and metrics_f is not None:

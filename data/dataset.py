@@ -13,7 +13,7 @@ from pathlib import Path
 # Cell Core Dataset
 # -----------------------------
 class NucleusCSV(Dataset):
-    def __init__(self, csv_path, class_to_idx: Dict[str,int], mean, std, use_img_uniform=False, augment=False):
+    def __init__(self, csv_path, class_to_idx: Dict[str,int], mean, std, size, use_img_uniform=False, augment=False):
         df = pd.read_csv(csv_path)
         self.df = df.copy()
 
@@ -36,11 +36,12 @@ class NucleusCSV(Dataset):
         self.class_to_idx = class_to_idx
 
         # transforms
-        self.size = 224  # DINOv2 ViT/B14 default is 224
+        self.size = size  
         mean = IMAGENET_DEFAULT_MEAN if mean is None else mean
         std  = IMAGENET_DEFAULT_STD  if std  is None else std
         
         base = [
+            transforms.Resize((self.size, self.size)),
             transforms.ToTensor(),                        # HWC [0..255] -> CHW [0..1]
             transforms.Lambda(lambda x: x.expand(3, *x.shape[1:]) if x.shape[0]==1 else x),
             transforms.Normalize(mean, std),
