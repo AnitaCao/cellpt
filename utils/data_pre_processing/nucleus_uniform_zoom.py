@@ -125,8 +125,8 @@ def main():
     first_img_dir = Path(usable.iloc[0]["img_path"]).parent
     slide_root = first_img_dir.parent
 
-    out_img_dir = slide_root / "img_uniform_zoomed"
-    out_msk_dir = slide_root / "mask_uniform_zoomed"
+    out_img_dir = slide_root / "img_uniform_3x"
+    out_msk_dir = slide_root / "mask_uniform_3x"
     out_meta_dir = slide_root / "meta"
     out_img_dir.mkdir(parents=True, exist_ok=True)
     out_msk_dir.mkdir(parents=True, exist_ok=True)
@@ -198,7 +198,7 @@ def main():
     print(f"\nDone: processed={processed}, skipped={skipped}")
 
     # Write new meta
-    out_meta_csv = out_meta_dir / "nucleus_shapes_uniform.csv"
+    out_meta_csv = out_meta_dir / "nucleus_shapes_uniform_3x.csv"
     df.to_csv(out_meta_csv, index=False)
     print(f"New meta written to: {out_meta_csv}")
 

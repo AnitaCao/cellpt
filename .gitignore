@@ -1,4 +1,5 @@
 __pycache__/
+**/__init__.py
 *.pyc
 *.pyo
 *.pyd
@@ -22,6 +23,7 @@ wandb/
 .ipynb_checkpoints/
 
 *.log
+**/.csv
 logs/
 outputs/
 
@@ -32,3 +34,12 @@ data/*/
 experiments/
 utils/*.png
 utils/*.csv
+
+#csv files for combined dataset. will open it later. 
+combined/
+
+#old files, need to delete later
+train_frozen_head.py
+train_lora_ddp.py
+train_lora.py
+train.py
