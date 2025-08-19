@@ -42,6 +42,7 @@ def add_lora_args(p: argparse.ArgumentParser):
     p.add_argument("--lora_alpha", type=float, default=32.0)
     p.add_argument("--lora_blocks", type=int, default=6)
     p.add_argument("--lora_dropout", type=float, default=0.0)
+    p.add_argument("--logit_tau", type=float, default=0.1)
     return p
 
 

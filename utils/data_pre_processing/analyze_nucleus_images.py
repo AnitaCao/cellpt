@@ -9,11 +9,12 @@ matplotlib.use("Agg")  # headless/back-end safe
 import matplotlib.pyplot as plt
 
 
-def analyze_nucleus_images(meta_csv: str, num_samples: int = 100, out_dir: str = "."):
+def analyze_nucleus_images(meta_csv: str, num_samples: int = 100, out_dir: str = ".", prefix: str = "nucleus"):
     """
     Quick sanity-check of nucleus crops.
     - Uses mask (if available) for area; otherwise intensity threshold fallback.
-    - Saves: sampled grid, stats plots, and a CSV of per-image measurements.
+    - Saves: sampled grid, stats plots, distribution histogram, and a CSV of per-image measurements.
+    - All output files will be named with the given prefix.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -30,6 +31,10 @@ def analyze_nucleus_images(meta_csv: str, num_samples: int = 100, out_dir: str =
     if len(df) == 0:
         raise RuntimeError("No usable rows after filtering (skipped_reason/Unknown).")
 
+    # Create distribution plot BEFORE sampling
+    dist_path = out_dir / f"{prefix}_cell_type_distribution.png"
+    create_distribution_plot(df, dist_path)
+    
     classes = sorted(df["cell_type"].unique())
     per_class = max(1, num_samples // max(1, len(classes)))
 
@@ -124,6 +129,9 @@ def analyze_nucleus_images(meta_csv: str, num_samples: int = 100, out_dir: str =
     print("NUCLEUS IMAGE ANALYSIS SUMMARY")
     print("=" * 60)
 
+    # Print distribution summary first
+    print_distribution_summary(df)
+
     avg_non_black = float(analysis_df["non_black_ratio"].mean())
     avg_diam_px = float(analysis_df["nucleus_diameter_px"].mean())
     avg_mean_int = float(analysis_df["mean_intensity"].mean())
@@ -151,14 +159,17 @@ def analyze_nucleus_images(meta_csv: str, num_samples: int = 100, out_dir: str =
     print(f"  Size variation across class means (std px):  {float(size_by_class.std()):.2f}")
 
     # ------------ figures ------------
-    grid_path = out_dir / "nucleus_samples_grid.png"
-    stats_path = out_dir / "nucleus_statistics.png"
+    grid_path = out_dir / f"{prefix}_samples_grid.png"
+    stats_path = out_dir / f"{prefix}_statistics.png"
     create_sample_grid(sampled_rows[:24], analysis_df, grid_path)
     create_statistics_plots(analysis_df, stats_path)
-    print(f"\nSaved figures:\n  {grid_path}\n  {stats_path}")
+    print(f"\nSaved figures:")
+    print(f"  {dist_path}")
+    print(f"  {grid_path}")
+    print(f"  {stats_path}")
 
     # ------------ save CSV ------------
-    csv_out = out_dir / "nucleus_analysis_results.csv"
+    csv_out = out_dir / f"{prefix}_analysis_results.csv"
     analysis_df.to_csv(csv_out, index=False)
     print(f"\nDetailed results saved to: {csv_out}")
 
@@ -187,38 +198,153 @@ def analyze_nucleus_images(meta_csv: str, num_samples: int = 100, out_dir: str =
     return analysis_df
 
 
-def create_sample_grid(sampled_rows, analysis_df: pd.DataFrame, out_path: Path):
-    """Save a 4×6 grid of sample images with tiny stats annotations."""
-    n = min(24, len(sampled_rows))
-    if n == 0:
-        return
-    rows, cols = 4, 6
-    fig, axes = plt.subplots(rows, cols, figsize=(15, 10))
-    axes = axes.flatten()
+def print_distribution_summary(df: pd.DataFrame):
+    """Print cell type distribution summary to console."""
+    distribution = df["cell_type"].value_counts().sort_values(ascending=False)
+    total_samples = len(df)
+    
+    print("Cell Type Distribution:")
+    print(f"  Total samples: {total_samples}")
+    print(f"  Number of classes: {len(distribution)}")
+    print()
+    
+    for cell_type, count in distribution.items():
+        percentage = (count / total_samples) * 100
+        print(f"  {cell_type:20s}: {count:6d} samples ({percentage:5.1f}%)")
+    
+    # Check for class imbalance
+    max_samples = distribution.max()
+    min_samples = distribution.min()
+    imbalance_ratio = max_samples / min_samples if min_samples > 0 else float('inf')
+    
+    print(f"\n  Class balance metrics:")
+    print(f"    Most frequent class: {max_samples} samples")
+    print(f"    Least frequent class: {min_samples} samples")
+    print(f"    Imbalance ratio: {imbalance_ratio:.1f}:1")
+    
+    if imbalance_ratio > 10:
+        print("  ⚠️  Significant class imbalance detected!")
 
-    for i in range(rows * cols):
-        axes[i].axis("off")
 
-    for i, row in enumerate(sampled_rows[:n]):
-        try:
-            img = Image.open(row["img_path"]).convert("L")
-            axes[i].imshow(img, cmap="gray")
-            axes[i].set_title(f"{row['cell_type'][:14]}", fontsize=8)
-            stats = analysis_df[analysis_df["image_path"] == row["img_path"]]
-            if len(stats) > 0:
-                ratio = float(stats["non_black_ratio"].iloc[0])
-                diam = float(stats["nucleus_diameter_px"].iloc[0])
-                axes[i].text(
-                    2, img.height - 6,
-                    f"ratio:{ratio:.2f}  d:{int(round(diam))}px",
-                    fontsize=6, color="white", va="bottom", ha="left",
-                    bbox=dict(facecolor="black", alpha=0.4, pad=1)
-                )
-        except Exception as e:
-            axes[i].text(0.5, 0.5, "ERR", ha="center", va="center")
-            continue
-
+def create_distribution_plot(df: pd.DataFrame, out_path: Path):
+    """Create a histogram showing the distribution of cell types."""
+    distribution = df["cell_type"].value_counts().sort_values(ascending=True)
+    
+    plt.figure(figsize=(12, max(6, len(distribution) * 0.3)))
+    
+    # Create horizontal bar plot
+    bars = plt.barh(range(len(distribution)), distribution.values)
+    
+    # Color bars with different colors
+    colors = plt.cm.Set3(np.linspace(0, 1, len(distribution)))
+    for bar, color in zip(bars, colors):
+        bar.set_color(color)
+    
+    # Customize the plot
+    plt.yticks(range(len(distribution)), distribution.index)
+    plt.xlabel('Number of Samples')
+    plt.title('Distribution of Cell Types', fontsize=14, pad=20)
+    plt.grid(axis='x', alpha=0.3)
+    
+    # Add value labels on bars
+    for i, (cell_type, count) in enumerate(distribution.items()):
+        plt.text(count + max(distribution.values()) * 0.01, i, 
+                str(count), va='center', ha='left', fontsize=9)
+    
+    # Add summary statistics as text box
+    total_samples = len(df)
+    num_classes = len(distribution)
+    max_samples = distribution.max()
+    min_samples = distribution.min()
+    imbalance_ratio = max_samples / min_samples if min_samples > 0 else float('inf')
+    
+    stats_text = f'Total: {total_samples} samples\nClasses: {num_classes}\nImbalance: {imbalance_ratio:.1f}:1'
+    plt.text(0.98, 0.98, stats_text, transform=plt.gca().transAxes, 
+             verticalalignment='top', horizontalalignment='right',
+             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8),
+             fontsize=10)
+    
     plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+
+
+def create_sample_grid(sampled_rows, analysis_df: pd.DataFrame, out_path: Path):
+    """Save a grid with one row per cell type, 6 random samples per row."""
+    if len(sampled_rows) == 0:
+        return
+    
+    # Group sampled rows by cell type
+    rows_by_type = {}
+    for row in sampled_rows:
+        cell_type = row["cell_type"]
+        if cell_type not in rows_by_type:
+            rows_by_type[cell_type] = []
+        rows_by_type[cell_type].append(row)
+    
+    # Sort cell types for consistent ordering
+    cell_types = sorted(rows_by_type.keys())
+    samples_per_row = 6
+    
+    # Create figure with appropriate dimensions
+    num_rows = len(cell_types)
+    fig, axes = plt.subplots(num_rows, samples_per_row, 
+                            figsize=(samples_per_row * 2.5, num_rows * 2.5))
+    
+    # Handle case where there's only one row
+    if num_rows == 1:
+        axes = axes.reshape(1, -1)
+    
+    # Turn off all axes initially
+    for i in range(num_rows):
+        for j in range(samples_per_row):
+            axes[i, j].axis("off")
+    
+    for row_idx, cell_type in enumerate(cell_types):
+        type_samples = rows_by_type[cell_type]
+        
+        # Take up to 6 samples (or all if fewer than 6)
+        samples_to_show = type_samples[:samples_per_row]
+        
+        # Add row label (cell type name) on the left
+        fig.text(0.02, 1 - (row_idx + 0.5) / num_rows, cell_type, 
+                rotation=90, va='center', ha='center', 
+                fontsize=12, fontweight='bold')
+        
+        for col_idx, sample_row in enumerate(samples_to_show):
+            try:
+                img = Image.open(sample_row["img_path"]).convert("L")
+                axes[row_idx, col_idx].imshow(img, cmap="gray")
+                
+                # Add stats annotation
+                stats = analysis_df[analysis_df["image_path"] == sample_row["img_path"]]
+                if len(stats) > 0:
+                    ratio = float(stats["non_black_ratio"].iloc[0])
+                    diam = float(stats["nucleus_diameter_px"].iloc[0])
+                    axes[row_idx, col_idx].text(
+                        2, img.height - 6,
+                        f"r:{ratio:.2f} d:{int(round(diam))}",
+                        fontsize=7, color="white", va="bottom", ha="left",
+                        bbox=dict(facecolor="black", alpha=0.6, pad=1)
+                    )
+                
+                # Add sample number
+                axes[row_idx, col_idx].text(
+                    2, 8, f"#{col_idx + 1}",
+                    fontsize=7, color="white", va="top", ha="left",
+                    bbox=dict(facecolor="blue", alpha=0.6, pad=1)
+                )
+                
+            except Exception as e:
+                axes[row_idx, col_idx].text(0.5, 0.5, "ERR", 
+                                          ha="center", va="center", 
+                                          fontsize=10, color="red")
+                continue
+    
+    plt.suptitle("Sample Images by Cell Type (6 samples per row)", 
+                fontsize=14, y=0.98)
+    plt.subplots_adjust(left=0.08, right=0.98, top=0.94, bottom=0.02, 
+                       hspace=0.1, wspace=0.05)
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
@@ -268,9 +394,10 @@ def parse_args():
     p.add_argument("--meta_csv", required=True, help="Path to nucleus_shapes.csv")
     p.add_argument("--num_samples", type=int, default=100, help="Total samples to analyze (split across classes)")
     p.add_argument("--out_dir", default=".", help="Directory to save figures and CSV")
+    p.add_argument("--prefix", default="nucleus", help="Prefix for all output files")
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    analyze_nucleus_images(args.meta_csv, args.num_samples, args.out_dir)
+    analyze_nucleus_images(args.meta_csv, args.num_samples, args.out_dir, args.prefix)

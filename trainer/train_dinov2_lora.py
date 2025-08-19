@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from PIL import Image
+from sklearn.metrics import classification_report, confusion_matrix
 
 import torch
 import torch.nn as nn
@@ -21,11 +22,15 @@ from config.opts import parse_args, add_lora_args
 from data.dataset import NucleusCSV
 from utils.utils import (
     set_seed, make_weighted_sampler, compute_metrics,
-    init_metrics_logger, log_metrics
+    init_metrics_logger, log_metrics, compute_per_class_metrics, gather_predictions_ddp, 
+    print_per_class_summary, class_counts_from_df,
+    class_weight_tensor_from_counts,
+    init_classifier_bias_from_counts
 )
 from model.lora import apply_lora_to_timm_vit
 
 from datetime import timedelta
+
 
 
 # -----------------------------
@@ -111,6 +116,16 @@ def main():
         alpha=args.lora_alpha,
         dropout=args.lora_dropout,
     )
+    
+    # Unfreeze norms in the last args.lora_blocks
+    total = len(model.blocks)
+    start = max(0, total - args.lora_blocks)
+    for i in range(start, total):
+        for name in ("norm1", "norm2"):
+            m = getattr(model.blocks[i], name, None)
+            if m is not None:
+                for p in m.parameters():
+                    p.requires_grad = True
 
     model.to(device)
 
@@ -133,13 +148,20 @@ def main():
     if is_main_process():
         print(f"Train samples: {len(train_ds)}")
         print(f"Val samples:   {len(val_ds)}")
+        # print real train counts aligned to head order
+        _counts = class_counts_from_df(train_ds.df, label_col="cell_type", classes=classes)
+        _total = max(1, _counts.sum())
+        print("Train class distribution:")
+        for cls, c in zip(classes, _counts):
+            pct = 100.0 * float(c) / float(_total)
+            print(f"  {cls:>24}: {c:7d} ({pct:5.1f}%)")
 
 
     # Sampler / loaders
     pw = args.num_workers > 0
     if is_ddp:
         # override any weighted sampler in DDP
-        if args.sampler == "weighted":
+        if args.sampler == "weighted" and is_main_process():
             print("DDP detected: overriding sampler=weighted -> DistributedSampler + class-weighted CE")
         train_sampler = DistributedSampler(train_ds, shuffle=True, drop_last=True)
         val_sampler   = DistributedSampler(val_ds,   shuffle=False, drop_last=False)
@@ -157,7 +179,15 @@ def main():
     else:
         # single-GPU weighted sampler path (unchanged)
         tdf = pd.read_csv(args.train_csv)
-        col = "img_path_uniform" if args.use_img_uniform and "img_path_uniform" in tdf.columns else "img_path"
+        if args.use_img_uniform:
+            if "img_path.1" in tdf.columns:
+                print(f"Using 'img_path.1' column for zoomed images.")
+                col = "img_path.1"
+            else:
+                raise RuntimeError(f"Column 'img_path.1' not found. ")
+        else:   
+            col = "img_path"
+            
         tdf = tdf[(tdf[col].map(lambda p: Path(str(p)).is_file())) & (tdf["skipped_reason"].fillna("") == "")]
         tdf = tdf[tdf["cell_type"].isin(class_to_idx.keys())]
         sampler = make_weighted_sampler(tdf, "cell_type")
@@ -168,35 +198,48 @@ def main():
                             sampler=val_sampler, num_workers=args.num_workers,
                             pin_memory=True, persistent_workers=pw)
 
-    # ---- Loss: class-weighted CE if we overrode weighted sampler ----
+    # ---- Class counts and loss weights ----
+    counts_np = class_counts_from_df(train_ds.df, label_col="cell_type", classes=classes)
     if is_ddp or args.sampler != "weighted":
-        # counts per class from the actual train dataset view we use
-        counts = train_ds.df["cell_type"].value_counts()
-        weights = []
-        for cls in classes:
-            w = 1.0 / max(1, counts.get(cls, 0))
-            weights.append(w)
-        w = torch.tensor(weights, dtype=torch.float)
-        w = w * (len(w) / w.sum())   # normalize around 1.0
-        criterion = nn.CrossEntropyLoss(weight=w.to(device))
+        w = class_weight_tensor_from_counts(
+            counts_np,
+            scheme="inv_sqrt",
+            normalize="mean",
+            clamp=(0.3, 3.0),
+            device=device,
+        )
+        criterion = nn.CrossEntropyLoss(weight=w, label_smoothing=0.10)
     else:
-        criterion = nn.CrossEntropyLoss()
+        criterion = nn.CrossEntropyLoss(label_smoothing=0.10)
         
     # ---- Optimizer & Schedule ----
     # Two groups: LoRA params vs head params
     # NOTE: if model is DDP, need to access .module to count head params (already frozen/unfrozen)
     raw_model = model.module if isinstance(model, DDP) else model
     head_params = [p for p in raw_model.head.parameters() if p.requires_grad]
+    
+    # One-time bias init from priors
+    init_classifier_bias_from_counts(raw_model.head, counts_np)
+    if is_main_process():
+        print("Initialized classifier bias from class priors.")
+    
 
     if is_main_process():
         lora_count = sum(p.numel() for p in lora_params)
         head_count = sum(p.numel() for p in head_params)
         print(f"Trainable (LoRA): {lora_count:,}")
         print(f"Trainable (head): {head_count:,}")
+        
+    norms = []
+    for i in range(start, total):
+        for name in ("norm1", "norm2"):
+            m = getattr(raw_model.blocks[i], name, None)
+            if m is not None:
+                norms += list(m.parameters())
 
     optim_groups = [
         {"params": lora_params, "lr": args.lr_lora, "weight_decay": args.weight_decay},
-        {"params": head_params, "lr": args.lr_head, "weight_decay": args.weight_decay},
+        {"params": head_params + norms, "lr": args.lr_head, "weight_decay": args.weight_decay},
     ]
     optimizer = torch.optim.AdamW(optim_groups)
 
@@ -215,7 +258,8 @@ def main():
     else:
         scheduler = None
 
-    scaler = torch.amp.GradScaler('cuda', enabled=torch.cuda.is_available())
+    amp_dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
+    scaler = torch.amp.GradScaler('cuda', enabled=(amp_dtype == torch.float16))
 
 
     # Save the used class map (rank 0)
@@ -229,7 +273,7 @@ def main():
     # Metrics logger (rank 0 only)
     if is_main_process():
         run_id = time.strftime("%Y%m%d-%H%M%S")
-        metrics_f, metrics_w = init_metrics_logger(args.out_dir, filename=f"metrics_{run_id}.csv")
+        metrics_f, metrics_w = init_metrics_logger(args.out_dir, filename=f"metrics_{run_id}.csv", classes=classes)
     else:
         run_id, metrics_f, metrics_w = "", None, None
 
@@ -259,7 +303,7 @@ def main():
             y = y.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):
+            with torch.amp.autocast(device_type='cuda', dtype=amp_dtype, enabled=torch.cuda.is_available()):
                 logits = model(x)
                 loss = criterion(logits, y)
 
@@ -291,61 +335,77 @@ def main():
         val_correct = 0
         val_total = 0
         val_loss_sum = 0.0
+        
+        all_val_preds = []
+        all_val_targets = []
 
-        with torch.inference_mode(), torch.amp.autocast('cuda',enabled=torch.cuda.is_available()):
+        with torch.inference_mode(), torch.amp.autocast(device_type='cuda', dtype=amp_dtype, enabled=torch.cuda.is_available()):
             for x, y in val_loader:
                 x = x.to(device, non_blocking=True)
                 y = y.to(device, non_blocking=True)
                 logits = model(x)
                 loss = criterion(logits, y)
                 val_loss_sum += loss.item() * y.size(0)
+                
+                preds = logits.argmax(1)
                 c, t = compute_metrics(logits, y)
                 val_correct += c
                 val_total += t
+                
+                all_val_preds.append(preds)
+                all_val_targets.append(y)
 
+        # Concatenate all predictions and targets
+        if all_val_preds:
+            local_preds = torch.cat(all_val_preds, dim=0)
+            local_targets = torch.cat(all_val_targets, dim=0)
+        else:
+            local_preds = torch.empty(0, dtype=torch.long, device=device)
+            local_targets = torch.empty(0, dtype=torch.long, device=device)
+                
+        
         # Reduce val aggregates
         if is_ddp:
             vv = torch.tensor([val_loss_sum, val_correct, val_total], dtype=torch.float64, device=device)
             dist.all_reduce(vv, op=dist.ReduceOp.SUM)
             val_loss_sum, val_correct, val_total = float(vv[0].item()), int(vv[1].item()), int(vv[2].item())
+            # Gather predictions for per-class metrics
+            all_preds, all_targets = gather_predictions_ddp(local_preds, local_targets, world_size, is_main_process())
+        else:
+            all_preds = local_preds
+            all_targets = local_targets
 
         train_loss = train_loss_sum / max(1, train_total)
         train_acc  = train_correct / max(1, train_total)
         val_loss   = val_loss_sum   / max(1, val_total)
         val_acc    = val_correct    / max(1, val_total)
         secs = time.time() - t0
+        
+        
+        per_class_metrics = None
+        if is_main_process() and len(all_preds) > 0:
+            per_class_metrics, _, _ = compute_per_class_metrics(all_preds, all_targets, classes)
 
         if is_main_process():
             print(f"Epoch {epoch:02d}/{args.epochs}  |  "
                   f"train_loss {train_loss:.4f}  train_acc {train_acc:.3f}  "
                   f"val_loss {val_loss:.4f}  val_acc {val_acc:.3f}  |  {secs:.1f}s")
+            
+            # Print per-class summary
+            if per_class_metrics:
+                print_per_class_summary(per_class_metrics, classes)
+            
 
             # Log metrics CSV
             lr_lora = optimizer.param_groups[0]["lr"]
             lr_head = optimizer.param_groups[1]["lr"] if len(optimizer.param_groups) > 1 else lr_lora
-            log_metrics(metrics_w, run_id, epoch, train_loss, train_acc, val_loss, val_acc, lr_head, lr_lora, secs)
+            log_metrics(metrics_w, run_id, epoch, train_loss, train_acc, val_loss, val_acc, 
+                        lr_head, lr_lora, secs, per_class_metrics, classes)
             metrics_f.flush()
 
-        # ---- DDP-safe prediction breakdown (every 5 epochs incl. 1) ----
-        if (epoch == 1 or epoch % 5 == 0):
-            # EVERY rank computes local counts and participates in the all-reduce
-            raw_model.eval()
-            local_counts = np.zeros(num_classes, dtype=np.int64)
-            with torch.inference_mode(), torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):
-                for x, _ in val_loader:
-                    x = x.to(device, non_blocking=True)
-                    logits = model(x)
-                    preds = logits.argmax(1).cpu().numpy()
-                    for p in preds:
-                        local_counts[p] += 1
-            counts = ddp_allreduce_counts(local_counts, device)
-            
-            if is_main_process():
-                total_preds = counts.sum()
-                print("  Val prediction breakdown (all ranks):")
-                for i, cls in enumerate(classes):
-                    frac = (counts[i] / max(1, total_preds)) * 100.0
-                    print(f"    {cls}: {counts[i]} ({frac:.1f}%)")
+        if is_main_process() and (epoch == 1 or epoch % 5 == 0):
+            if all_preds.numel() > 0 and all_targets.numel() > 0:
+                print_per_class_summary(per_class_metrics, classes)
 
         # Save best
         if is_main_process() and (val_acc > best_acc):
