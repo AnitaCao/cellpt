@@ -52,11 +52,11 @@ class NucleusCSV(Dataset):
 
         # choose column
         if use_img_uniform:
-            if "img_path.1" in df.columns:
-                print(f"Using 'img_path.1' column from {csv_path} for images.")
-                col = "img_path.1"
+            if "img_path_uniform" in df.columns:
+                print(f"Using 'img_path_uniform' column from {csv_path} for images.")
+                col = "img_path_uniform"
             else:
-                raise RuntimeError(f"Column 'img_path.1' not found in {csv_path}. ")
+                raise RuntimeError(f"Column 'img_path_uniform' not found in {csv_path}. ")
         else:   
             col = "img_path"
         #col = "img_path.1" if use_img_uniform and "img_path.1" in df.columns else "img_path"

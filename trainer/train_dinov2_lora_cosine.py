@@ -14,13 +14,16 @@ from torch.utils.data import DataLoader
 import timm
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 
+from utils.utils import make_weighted_sampler
+from sklearn.metrics import f1_score, classification_report
+
 # local imports you already have
 from config.opts import parse_args, add_lora_args
 from data.dataset import NucleusCSV
 from utils.utils import (
     set_seed, compute_metrics,
     init_metrics_logger, log_metrics, compute_per_class_metrics,
-    print_per_class_summary, class_counts_from_df
+    print_per_class_summary, class_counts_from_df, maybe_init_wandb
 )
 from model.lora import apply_lora_to_timm_vit
 
@@ -33,25 +36,13 @@ class CosineHead(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.randn(out_dim, in_dim))
         nn.init.kaiming_normal_(self.weight, nonlinearity="linear")
-        self.s = nn.Parameter(torch.tensor(s_init, dtype=torch.float32))
+        self._s_unconstrained = nn.Parameter(torch.tensor(s_init, dtype=torch.float32))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = F.normalize(x, dim=1)
         w = F.normalize(self.weight, dim=1)
-        return self.s * (x @ w.t())
-
-
-def monitor_temperature_and_adjustments(model: nn.Module, logit_adj: torch.Tensor, classes: List[str], epoch: int):
-    """Print cosine temperature and the most extreme logit adjustments."""
-    try:
-        temp = float(model.head.s.item())
-    except Exception:
-        temp = float("nan")
-    adj_values = logit_adj.squeeze().detach().cpu().numpy()
-    min_idx = int(np.argmin(adj_values))
-    max_idx = int(np.argmax(adj_values))
-    print(f"  Cosine temperature: {temp:.2f} | Logit adj extremes: "
-          f"{classes[max_idx]} (+{adj_values[max_idx]:.2f}), {classes[min_idx]} ({adj_values[min_idx]:.2f})")
+        s = F.softplus(self._s_unconstrained) + 1e-6# ensure s is positive
+        return s * (x @ w.t())
 
 
 class MacroF1EarlyStopping:
@@ -91,8 +82,6 @@ def detailed_prediction_analysis(all_preds: torch.Tensor, all_targets: torch.Ten
         print(f"{cls:<25} {tp:<8.1f} {pp:<8.1f} {ratio:<8.2f} {status}")
 
 
-
-
 def is_main_process() -> bool:
     # single GPU script, always true
     return True
@@ -100,6 +89,22 @@ def is_main_process() -> bool:
 
 def main():
     args = parse_args(add_lora_args)
+    
+    #print args
+    print("Training DINOv2 with LoRA and Cosine Head")
+    print("==> Launch config")
+    for k, v in vars(args).items():
+        print(f"  {k}: {v}")
+     
+            
+    def _make_worker_init_fn(seed):
+        def _init(worker_id):
+            np.random.seed(seed + worker_id)
+            torch.manual_seed(seed + worker_id)
+        return _init
+
+    worker_init = _make_worker_init_fn(args.seed)
+    
     set_seed(args.seed)
     torch.set_float32_matmul_precision("high")
     os.makedirs(args.out_dir, exist_ok=True)
@@ -131,7 +136,16 @@ def main():
 
     # Replace linear head with cosine head, then unfreeze head
     in_dim = getattr(model.head, "in_features", getattr(model, "num_features"))
-    model.head = CosineHead(in_dim, num_classes, s_init=20.0)
+    model.head = CosineHead(in_dim, num_classes, s_init=30.0)
+    
+    assert num_classes == model.head.weight.size(0), "Head out_dim does not match class map"
+    
+    # Freeze the temperature so it cannot drift
+    with torch.no_grad():
+        # keep s_init as the fixed scale
+        model.head._s_unconstrained.copy_(torch.log(torch.expm1(torch.tensor(30.0))))
+    model.head._s_unconstrained.requires_grad = False
+    
     for p in model.head.parameters():
         p.requires_grad = True
 
@@ -181,21 +195,50 @@ def main():
 
     # ---- DataLoaders (single GPU) ----
     pw = args.num_workers > 0
-    train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=True, persistent_workers=pw
-    )
+    # Optional: WeightedRandomSampler for imbalance
+    use_ws = bool(getattr(args, "use_weighted_sampler", False))
+    label_col = "cell_type"
+    if use_ws:
+        sampler = make_weighted_sampler(train_ds.df, label_col=label_col)
+        print(f"Using WeightedRandomSampler on '{label_col}'")
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=args.batch_size,
+            sampler=sampler,          # sampler implies shuffle must be False
+            shuffle=False,
+            num_workers=args.num_workers,
+            worker_init_fn=worker_init,
+            pin_memory=True,
+            persistent_workers=pw,
+            drop_last=True,
+        )
+    else:
+        train_loader = DataLoader(
+            train_ds, batch_size=args.batch_size, shuffle=True,
+            num_workers=args.num_workers,
+            worker_init_fn=worker_init, 
+            pin_memory=True, 
+            persistent_workers=pw
+        )
     val_loader = DataLoader(
         val_ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, pin_memory=True, persistent_workers=pw
+        num_workers=args.num_workers,
+        worker_init_fn=worker_init,
+        pin_memory=True, 
+        persistent_workers=pw
     )
 
+    amp_dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
+    scaler = torch.amp.GradScaler('cuda', enabled=(amp_dtype == torch.float16))
+
     # ---- Logit adjustment from priors (with tunable tau) ----
-    prior = torch.from_numpy(counts_np.astype(np.float64) / counts_np.sum()).to(device=device, dtype=torch.float32)
-    tau = float(getattr(args, "logit_tau", 1.0))  # if not in args, default to 1.0
-    logit_adj = tau * torch.log(prior + 1e-12)    # shape [C]
-    logit_adj = logit_adj.view(1, -1)             # shape [1, C]
-    label_smoothing = 0.05
+    prior = torch.from_numpy((counts_np.astype(np.float64) / counts_np.sum()))
+    prior = prior.clamp_min(1e-12).to(device=device, dtype=torch.float32)
+    log_prior = torch.log(prior)
+    tau = float(getattr(args, "logit_tau", 0.3))  # gentler than 1.0 or 0.5
+    adj = (tau * log_prior).view(1, -1)
+    adj = adj - adj.mean()  # centering keeps numerics tame without changing probabilities
+    label_smoothing = 0.0   # see C
     print(f"\nLogit adjustment enabled with tau={tau:.2f}")
  
     # ---- Early stopping on macro F1 ----
@@ -207,7 +250,7 @@ def main():
     for n, p in model.head.named_parameters():
         if not p.requires_grad:
             continue
-        if n == "s":
+        if n == "_s_unconstrained":
             head_scale_params.append(p)
         else:
             head_weight_params.append(p)
@@ -234,9 +277,6 @@ def main():
     else:
         scheduler = None
 
-    amp_dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
-    scaler = torch.amp.GradScaler('cuda', enabled=(amp_dtype == torch.float16))
-
     # Save the used class map
     with open(Path(args.out_dir, "class_to_idx.used.json"), "w") as f:
         json.dump(class_to_idx, f, indent=2)
@@ -247,6 +287,8 @@ def main():
     # Metrics logger
     run_id = time.strftime("%Y%m%d-%H%M%S")
     metrics_f, metrics_w = init_metrics_logger(args.out_dir, filename=f"metrics_{run_id}.csv", classes=classes)
+    
+    wandb_mod, wb_run = maybe_init_wandb(args, classes, run_id, args.out_dir)
 
     print("\nStarting training (single GPU)...")
     print("Using cosine head and logit adjusted cross entropy")
@@ -268,7 +310,8 @@ def main():
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type='cuda', dtype=amp_dtype, enabled=torch.cuda.is_available()):
                 logits = model(x)                # cosine head returns logits
-                loss = F.cross_entropy(logits + logit_adj, y, label_smoothing=label_smoothing)
+                logits_adj = logits - adj.to(dtype=logits.dtype)   # subtract log prior to favor tails
+                loss = F.cross_entropy(logits_adj, y, label_smoothing=label_smoothing)
 
             scaler.scale(loss).backward()
 
@@ -280,7 +323,7 @@ def main():
             scaler.update()
 
             train_loss_sum += loss.item() * y.size(0)
-            c, t = compute_metrics(logits.detach(), y)
+            c, t = compute_metrics(logits_adj.detach(), y)
             train_correct += c
             train_total += t
 
@@ -289,9 +332,11 @@ def main():
 
         # ---- Validation ----
         model.eval()
-        val_correct = 0
         val_total = 0
         val_loss_sum = 0.0
+        
+        val_correct_raw = 0
+        val_correct_adj = 0
 
         all_val_preds = []
         all_val_targets = []
@@ -301,14 +346,19 @@ def main():
                 x = x.to(device, non_blocking=True)
                 y = y.to(device, non_blocking=True)
                 logits = model(x)
-                loss = F.cross_entropy(logits + logit_adj, y, label_smoothing=label_smoothing)
+                logits_adj = logits - adj.to(dtype=logits.dtype)
+                
+                # loss for reporting: use RAW logits to keep validation consistent
+                loss = F.cross_entropy(logits, y, label_smoothing=0)
                 val_loss_sum += loss.item() * y.size(0)
 
-                preds = logits.argmax(1)
-                c, t = compute_metrics(logits, y)
-                val_correct += c
-                val_total += t
+                c_raw, t = compute_metrics(logits, y)
+                c_adj, _ = compute_metrics(logits_adj, y)
+                val_correct_raw += c_raw
+                val_correct_adj += c_adj
 
+                # predictions: use RAW for per-class metrics by default
+                preds = logits.argmax(1)
                 all_val_preds.append(preds)
                 all_val_targets.append(y)
 
@@ -324,25 +374,42 @@ def main():
         train_loss = train_loss_sum / max(1, train_total)
         train_acc  = train_correct / max(1, train_total)
         val_loss   = val_loss_sum   / max(1, val_total)
-        val_acc    = val_correct    / max(1, val_total)
+        val_acc_raw = val_correct_raw / max(1, val_total)
+        val_acc_adj = val_correct_adj / max(1, val_total)
         secs = time.time() - t0
 
         per_class_metrics = None
         if len(all_preds) > 0:
             per_class_metrics, _, _ = compute_per_class_metrics(all_preds, all_targets, classes)
 
-        # Compute macro F1 from per class metrics
+         # Compute macro metrics from per class metrics (ignore NaNs)
         macro_f1 = None
         if per_class_metrics:
-            macro_f1 = float(np.mean([m["f1"] for m in per_class_metrics]))
+            macro_f1 = float(per_class_metrics.get("macro_f1", float("nan")))
+            if np.isnan(macro_f1):
+                macro_f1 = float(
+                    f1_score(
+                        all_targets.numpy(),
+                        all_preds.numpy(),
+                        average="macro",
+                        zero_division=0,
+                    )
+                )
             print(f"Epoch {epoch:02d}/{args.epochs}  |  "
                   f"train_loss {train_loss:.4f}  train_acc {train_acc:.3f}  "
-                  f"val_loss {val_loss:.4f}  val_acc {val_acc:.3f}  "
-                  f"macro_f1 {macro_f1:.3f}  |  {secs:.1f}s")
+                  f"val_loss {val_loss:.4f}  val_acc_raw {val_acc_raw:.3f}  "
+                  f"val_acc_adj {val_acc_adj:.3f}  "
+                  f"macro_f1 {macro_f1 if macro_f1 is not None else float('nan'):.3f}  |  {secs:.1f}s")
             print_per_class_summary(per_class_metrics, classes)
          # Temperature and adjustment monitor (first 5 epochs, then every 5)
             if epoch <= 5 or epoch % 5 == 0:
-                monitor_temperature_and_adjustments(model, logit_adj, classes, epoch)
+                # show extremes of the actual subtraction term
+                adj_vals = (-adj).squeeze().detach().cpu().numpy()  # this is what we add to logits effectively
+                mi, ma = int(np.argmin(adj_vals)), int(np.argmax(adj_vals))
+                temp = float(F.softplus(model.head._s_unconstrained).item())
+                print(f"  Cosine temperature: {temp:.2f} | Adjustment extremes: "
+                    f"{classes[ma]} ({adj_vals[ma]:+.2f}), {classes[mi]} ({adj_vals[mi]:+.2f})")
+                
             # Optional 10-epoch prediction breakdown
             detailed_prediction_analysis(all_preds, all_targets, classes, epoch)
         else:
@@ -358,9 +425,25 @@ def main():
             lr_head, lr_lora, secs, per_class_metrics, classes
         )
         metrics_f.flush()
+        
+        # W&B logging
+        if wb_run is not None:
+            # macro_f1 may be None if per_class_metrics missing
+            m_f1 = 0.0
+            if 'macro_f1' in locals() and macro_f1 is not None and not np.isnan(macro_f1):
+                m_f1 = float(macro_f1)
+            wandb_mod.log({
+                "epoch": epoch,
+                "train/loss": train_loss, "train/acc": train_acc,
+                "val/loss": val_loss, "val/acc": val_acc,
+                "val/macro_f1": m_f1,
+                "lr/head": lr_head, "lr/lora": lr_lora,
+                "time/epoch_sec": secs
+            }, step=epoch)
+
 
         # Save best by macro F1
-        if macro_f1 is not None and macro_f1 > best_macro_f1:
+        if macro_f1 is not None and not np.isnan(macro_f1) and macro_f1 > best_macro_f1:
             best_macro_f1 = macro_f1
             to_save = model.state_dict()
             torch.save({
@@ -373,12 +456,19 @@ def main():
             print(f"  ✓ Saved new best (macro F1={best_macro_f1:.3f}) to {best_path}")
             
         # Early stopping
-        if macro_f1 is not None and early_stopping(macro_f1):
+        if macro_f1 is not None and not np.isnan(macro_f1) and early_stopping(macro_f1):
             break   
             
 
     if metrics_f is not None:
         metrics_f.close()
+        
+    if 'wb_run' in locals() and wb_run is not None:
+        try:
+            wb_run.finish()
+        except Exception:
+            pass
+    
     print(f"\nDone. Best macro F1={best_macro_f1:.3f}")
     print(f"Checkpoint: {best_path}")
 

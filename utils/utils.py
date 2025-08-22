@@ -7,6 +7,7 @@ import torch
 from torch.utils.data import WeightedRandomSampler
 import torch.distributed as dist
 from typing import Optional, Sequence, Tuple
+import os
 
 # -----------------------------
 # Reproducibility
@@ -107,12 +108,10 @@ def compute_per_class_metrics(all_preds, all_targets, classes):
     
     metrics = {
         'overall_acc': overall_acc,
-        'per_class_acc': per_class_acc,
         'per_class_precision': per_class_precision, 
         'per_class_recall': per_class_recall,
         'per_class_f1': per_class_f1,
         'per_class_support': per_class_support,
-        'macro_acc': per_class_acc.mean(),
         'macro_precision': per_class_precision.mean(),
         'macro_recall': per_class_recall.mean(), 
         'macro_f1': per_class_f1.mean()
@@ -228,7 +227,6 @@ def log_metrics(writer, run_id, epoch, train_loss, train_acc, val_loss, val_acc,
 # -----------------------------
 # Class weights and priors
 # -----------------------------
-from typing import Optional, Sequence, Tuple
 
 def class_counts_from_df(df, label_col: str, classes: Sequence[str]) -> np.ndarray:
     """
@@ -316,4 +314,30 @@ def init_classifier_bias_from_counts(head_module: torch.nn.Module, counts: np.nd
     if hasattr(head_module, "bias") and head_module.bias is not None:
         b = prior_logits_from_counts(counts)
         with torch.no_grad():
-            head_module.bias.copy_(torch.from_numpy(b).to(head_module.bias.device).to(head_module.bias.dtype))
+            head_module.bias.copy_(
+                torch.from_numpy(b)
+                .to(head_module.bias.device)
+                .to(head_module.bias.dtype)
+            )
+
+
+def maybe_init_wandb(args, classes, run_id: str, out_dir: str):
+    """
+    Enable W&B if env WANDB=1. Optional envs:
+      WANDB_PROJECT, WANDB_RUN_NAME, WANDB_MODE=offline
+    Returns (wandb_module, run) or (None, None) if disabled or unavailable.
+    """
+    if os.environ.get("WANDB", "0") != "1":
+        return None, None
+    try:
+        import wandb as wb
+    except Exception as e:
+        print(f"WandB not available: {e}")
+        return None, None
+    project = os.environ.get("WANDB_PROJECT", "cellpt")
+    name = os.environ.get("WANDB_RUN_NAME", f"{Path(out_dir).name}-{run_id}")
+    cfg = dict(vars(args))
+    cfg.update({"num_classes": len(classes), "classes": classes})
+    run = wb.init(project=project, name=name, config=cfg)
+    print(f"WandB logging enabled: project={project}, run={name}")
+    return wb, run

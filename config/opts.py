@@ -14,6 +14,8 @@ def add_common_args(p: argparse.ArgumentParser):
     p.add_argument("--out_dir",   type=str, default=None)
     p.add_argument("--use_img_uniform", action="store_true")
     p.add_argument("--img_size", type=int, default=224)
+    p.add_argument("--use_weighted_sampler", action="store_true",
+                    help="Use WeightedRandomSampler for the training DataLoader")
 
 
     # model / training

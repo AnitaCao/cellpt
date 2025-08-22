@@ -69,5 +69,11 @@ def apply_lora_to_timm_vit(model, last_n_blocks=6, r=8, alpha=16, dropout=0.0):
         if hasattr(blk.mlp, "fc2") and isinstance(blk.mlp.fc2, nn.Linear):
             blk.mlp.fc2 = LoRALinear(blk.mlp.fc2, r=r, alpha=alpha, dropout=dropout)
             lora_params += list(blk.mlp.fc2.lora_down.parameters()) + list(blk.mlp.fc2.lora_up.parameters())
+            
+    
+    for p in lora_params:
+        p.requres_grad = True
+    
+    assert len(lora_params) > 0, "No LoRA parameters found. Check the model structure."
 
     return lora_params
