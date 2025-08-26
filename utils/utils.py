@@ -112,9 +112,11 @@ def compute_per_class_metrics(all_preds, all_targets, classes):
         'per_class_recall': per_class_recall,
         'per_class_f1': per_class_f1,
         'per_class_support': per_class_support,
+        'per_class_acc': per_class_acc, 
         'macro_precision': per_class_precision.mean(),
         'macro_recall': per_class_recall.mean(), 
-        'macro_f1': per_class_f1.mean()
+        'macro_f1': per_class_f1.mean(),
+        'macro_acc': per_class_acc.mean()
     }
     
     return metrics, per_class_acc, per_class_support
