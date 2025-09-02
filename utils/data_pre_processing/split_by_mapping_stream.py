@@ -27,10 +27,10 @@ def make_targets(counts, train_frac, val_frac):
 def stream_assign(csv_path, out_dir, stem, label_col, allowed, targets, seed):
     rng = np.random.default_rng(seed)
     with open(csv_path, newline='') as f_in, \
-         open(out_dir / f"{stem}_selected_with_splits.csv", "w", newline='') as f_all, \
-         open(out_dir / f"{stem}_selected_train.csv", "w", newline='') as f_tr, \
-         open(out_dir / f"{stem}_selected_val.csv", "w", newline='') as f_va, \
-         open(out_dir / f"{stem}_selected_test.csv", "w", newline='') as f_te:
+         open(out_dir / f"{stem}_selected_with_splits_fine.csv", "w", newline='') as f_all, \
+         open(out_dir / f"{stem}_selected_train_fine.csv", "w", newline='') as f_tr, \
+         open(out_dir / f"{stem}_selected_val_fine.csv", "w", newline='') as f_va, \
+         open(out_dir / f"{stem}_selected_test_fine.csv", "w", newline='') as f_te:
 
         r = csv.DictReader(f_in)
         base_fields = r.fieldnames
@@ -78,8 +78,8 @@ def main():
     ap.add_argument("--meta_csv", required=True)
     ap.add_argument("--class_to_idx", required=True)
     ap.add_argument("--out_dir", default=None)
-    ap.add_argument("--label_col", default="cell_type")
-    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--label_col", default="cell_type") # or "cell_type_coarse"
+    ap.add_argument("--seed", type=int, default=23)
     ap.add_argument("--train_frac", type=float, default=0.8)
     ap.add_argument("--val_frac", type=float, default=0.1)
     args = ap.parse_args()

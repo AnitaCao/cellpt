@@ -32,7 +32,7 @@ def main():
     ap.add_argument("--meta_csv", required=True, help="combined_meta_original.csv")
     ap.add_argument("--class_to_idx", required=True, help="class_to_idx.json")
     ap.add_argument("--out_dir", default=None, help="Output dir (default: same as meta_csv)")
-    ap.add_argument("--label_col", default="cell_type")
+    ap.add_argument("--label_col", default="cell_type") # or "cell_type_coarse"
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--train_frac", type=float, default=0.8)
     ap.add_argument("--val_frac", type=float, default=0.1)

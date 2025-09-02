@@ -627,9 +627,9 @@ def process_nucleus_shapes_mpp(slide_id, ome_or_dir, zarr_path, out_root,
 def main():
     ap = argparse.ArgumentParser(description="Extract nucleus shapes with biological scale preservation - no coverage filtering")
     ap.add_argument("--slide_id", default="Xenium_human_Pancreas_FFPE")
-    ap.add_argument("--ome", default="/hpc/group/jilab/rz179/XeniumData/Xenium_human_Pancreas_FFPE",
+    ap.add_argument("--ome", default="",
                     help="OME file OR the run directory")
-    ap.add_argument("--zarr", default="/hpc/group/jilab/rz179/XeniumData/Xenium_human_Pancreas_FFPE/cells.zarr.zip")
+    ap.add_argument("--zarr", default="")
     ap.add_argument("--out_root", default="/hpc/group/jilab/rz179/cellpt/nucleus_data")
     ap.add_argument("--channel_index", type=int, default=0, help="DAPI channel index")
     ap.add_argument("--out_size", type=int, default=224, help="Output canvas size")
@@ -639,7 +639,7 @@ def main():
     # Visual parameters
     ap.add_argument("--bg_type", default="median", choices=['median', 'black', 'noise'],
                     help="Background type for nucleus placement")
-    ap.add_argument("--jitter", type=int, default=3, help="Random position jitter in pixels")
+    ap.add_argument("--jitter", type=int, default=0, help="Random position jitter in pixels")
     
     # Processing parameters
     ap.add_argument("--pad_px", type=int, default=64, help="Padding around nucleus for window extraction")

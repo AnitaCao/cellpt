@@ -88,6 +88,8 @@ def is_main_process() -> bool:
     return True
 
 
+
+
 def main():
     args = parse_args(add_lora_args)
 
@@ -95,12 +97,27 @@ def main():
     print("==> Launch config")
     for k, v in vars(args).items():
         print(f"  {k}: {v}")
+        
+    
+    debug_mode = os.environ.get("DEBUG_MODE", "0") == "1"
+    
+    
+    smooth_on = os.environ.get("SMOOTH_SAMPLER", "0") == "1"
+    smooth_alpha = float(os.environ.get("SMOOTH_ALPHA", "0.5"))   # 0.5 is sqrt smoothing
+    epoch_budget = int(os.environ.get("EPOCH_BUDGET", "0")) 
 
     def _make_worker_init_fn(seed):
         def _init(worker_id):
             np.random.seed(seed + worker_id)
             torch.manual_seed(seed + worker_id)
         return _init
+    
+    def _find_group_lr(optimizer, param_set):
+        for g in optimizer.param_groups:
+            # any param from the set in this group?
+            if any(p in param_set for p in g["params"]):
+                return g["lr"]
+        return None
 
     worker_init = _make_worker_init_fn(args.seed)
 
@@ -129,9 +146,12 @@ def main():
     mean = tuple(model.pretrained_cfg.get('mean', IMAGENET_DEFAULT_MEAN))
     std = tuple(model.pretrained_cfg.get('std', IMAGENET_DEFAULT_STD))
 
-    # Freeze everything
-    for p in model.parameters():
-        p.requires_grad = False
+    unfreeze = bool(getattr(args, "unfreeze_backbone", False))
+    # Freeze or unfreeze
+    if unfreeze:
+        for p in model.parameters(): p.requires_grad = True
+    else:
+        for p in model.parameters(): p.requires_grad = False
 
     # Replace linear head with cosine head, then unfreeze head
     in_dim = getattr(model.head, "in_features", getattr(model, "num_features"))
@@ -142,50 +162,72 @@ def main():
     for p in model.head.parameters():
         p.requires_grad = True
         
-    # freeze temperature to stabilize CE
-    with torch.no_grad():
-        target_s = torch.tensor(30.0)
-        model.head._s_unconstrained.copy_(torch.log(torch.expm1(target_s)))
-    model.head._s_unconstrained.requires_grad = False
+    if debug_mode:
+        # fixed scale, no grad
+        with torch.no_grad():
+            model.head._s_unconstrained.copy_(torch.log(torch.expm1(torch.tensor(30.0))))
+        model.head._s_unconstrained.requires_grad = False
+    else:
+        with torch.no_grad():
+            target_s = torch.tensor(30.0)
+            model.head._s_unconstrained.copy_(torch.log(torch.expm1(target_s)))
+        model.head._s_unconstrained.requires_grad = True
 
     # Inject LoRA adapters into last N blocks
-    lora_params = apply_lora_to_timm_vit(
-        model,
-        last_n_blocks=args.lora_blocks,
-        r=args.lora_rank,
-        alpha=args.lora_alpha,
-        dropout=args.lora_dropout,
-    )
+    lora_params = []
+    if not unfreeze:
+        lora_params = apply_lora_to_timm_vit(
+            model,
+            last_n_blocks=args.lora_blocks,
+            r=args.lora_rank,
+            alpha=args.lora_alpha,
+            dropout=args.lora_dropout,
+        )
 
     # Unfreeze norms in the last args.lora_blocks
-    total_blocks = len(model.blocks)
-    start = max(0, total_blocks - args.lora_blocks)
     norms = []
-    for i in range(start, total_blocks):
-        for name in ("norm1", "norm2"):
-            m = getattr(model.blocks[i], name, None)
-            if m is not None:
-                for p in m.parameters():
-                    p.requires_grad = True
-                norms += list(m.parameters())
+    if not unfreeze:
+        total_blocks = len(model.blocks)
+        start = max(0, total_blocks - args.lora_blocks)
+        for i in range(start, total_blocks):
+            for name in ("norm1", "norm2"):
+                m = getattr(model.blocks[i], name, None)
+                if m is not None:
+                    for p in m.parameters(): p.requires_grad = True
+                    norms += list(m.parameters())
 
     model.to(device)
+    
+    try:
+        n_lora = sum(p.numel() for p in lora_params)
+        print(f"LoRA trainable params: {n_lora}")
+    except Exception:
+        pass
 
+
+    label_col = args.label_col if hasattr(args, "label_col") else "cell_type" 
+    print(f"Using label column: {label_col}")
     # ---- Datasets ----
     train_ds = NucleusCSV(
-        args.train_csv, class_to_idx, size=args.img_size, mean=mean, std=std,
-        use_img_uniform=args.use_img_uniform, augment=True
+        args.train_csv, class_to_idx, size=args.img_size, mean=mean, std=std, label_col=label_col,
+        use_img_uniform=args.use_img_uniform, augment=(not debug_mode)
     )
     val_ds = NucleusCSV(
-        args.val_csv, class_to_idx, size=args.img_size, mean=mean, std=std,
+        args.val_csv, class_to_idx, size=args.img_size, mean=mean, std=std, label_col=label_col,
         use_img_uniform=args.use_img_uniform, augment=False
     )
 
     print(f"Train samples: {len(train_ds)}")
+    
+    if unfreeze:
+        print(f"Full finetune mode: unfreeze_backbone=1  lr_backbone={args.lr_backbone}")
+    
     print(f"Val samples:   {len(val_ds)}")
+    
+    
 
     # Print real train counts aligned to head order
-    counts_np = class_counts_from_df(train_ds.df, label_col="cell_type", classes=classes)
+    counts_np = class_counts_from_df(train_ds.df, label_col=label_col, classes=classes)
     total = max(1, counts_np.sum())
     print("Train class distribution:")
     for cls, c in zip(classes, counts_np):
@@ -194,20 +236,22 @@ def main():
 
     # ---- DataLoaders (single GPU) ----
     pw = args.num_workers > 0
+    
+    pin = (device.type == "cuda")
+    pw_flag = pw if pin else False
 
-    # We'll optionally use Repeat-Factor Sampler (RFS) for the pre-stage only (before LA starts).
-    # We DO NOT combine a weighted sampler with logit adjustment.
-    # Build a standard shuffle loader (used after LA starts).
+    #Build both loaders. We use power-smoothing batches by default;
+    # LA still computes targets from natural priors (prior_csv/train counts).
     train_loader_shuffle = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, worker_init_fn=worker_init,
-        pin_memory=True, persistent_workers=pw, drop_last=True
+        pin_memory=pin, persistent_workers=pw_flag, drop_last=True
     )
-
+    
     val_loader = DataLoader(
         val_ds, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, worker_init_fn=worker_init,
-        pin_memory=True, persistent_workers=pw
+        pin_memory=pin, persistent_workers=pw_flag
     )
 
     amp_dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
@@ -221,13 +265,13 @@ def main():
         try:
             cdf = pd.read_csv(prior_csv)
             # choose an image column that exists
-            cand_cols = ["img_path_uniform", "img_path.1", "img_path", "img_path.0"]
+            cand_cols = ["img_path_uniform", "img_path"]
             col = next((c for c in cand_cols if c in cdf.columns), None)
             if col is None:
                 raise RuntimeError("No image path column found in prior_csv.")
             cdf = cdf[(cdf[col].map(lambda p: Path(str(p)).is_file()))]
-            cdf = cdf[cdf["cell_type"].isin(class_to_idx.keys())]
-            vc = cdf["cell_type"].value_counts()
+            cdf = cdf[cdf[label_col].isin(class_to_idx.keys())]
+            vc = cdf[label_col].value_counts()
             prior_counts_np = np.array([int(vc.get(c, 0)) for c in classes], dtype=np.int64)
             print(f"Using priors from prior_csv={prior_csv}")
         except Exception as e:
@@ -241,7 +285,7 @@ def main():
     
     # Env toggles for convergence experiments
     early_stop_off = os.environ.get("EARLY_STOP_OFF", "0") == "1"
-    rfs_all_epochs = os.environ.get("RFS_ALL_EPOCHS", "1") == "1"  # keep RFS every epoch when LA is off
+
 
     # LA schedule (read via getattr so it works even if your parser doesn't define these flags)
     tau_target = float(getattr(args, "logit_tau", 1.0))
@@ -251,38 +295,44 @@ def main():
     
     la_start_epoch = int(getattr(args, "la_start_epoch", 3))   # no LA before this epoch
     la_ramp_epochs = int(getattr(args, "la_ramp_epochs", 3))   # ramp length
-    rfs_prestage = bool(getattr(args, "rfs_prestage", True))   # use RFS only before LA starts
-    rfs_t = float(getattr(args, "rfs_t", 0.02))                # rarity threshold for RFS
     
-    print(f"DISABLE_LA={'1' if tau_target==0.0 else '0'}  RFS_ALL_EPOCHS={'1' if rfs_all_epochs else '0'}  EARLY_STOP_OFF={'1' if early_stop_off else '0'}")
+    print(f"DISABLE_LA={'1' if tau_target==0.0 else '0'}  EARLY_STOP_OFF={'1' if early_stop_off else '0'}")
+    
+    
+    if smooth_on:
+        eb_text = epoch_budget if epoch_budget > 0 else "full"
+        print(f"Power smoothing enabled: alpha={smooth_alpha:.3f}  epoch_budget={eb_text}")
     
     print(f"\nLogit adjustment configured: tau_target={tau_target:.2f}, "
           f"la_start_epoch={la_start_epoch}, la_ramp_epochs={la_ramp_epochs}")
+    
+    train_loader_smooth = None
 
-    # Build an RFS sampler for the pre-stage if requested
-    def _build_rfs_sampler(df: pd.DataFrame, classes_: List[str], t: float = 0.02):
-        N = len(df)
-        freq = df["cell_type"].value_counts()
-        f = {c: float(freq.get(c, 0)) / max(1, N) for c in classes_}
-        # Detectron2-style: r_c = max(1, sqrt(t / f_c))
-        r = {c: max(1.0, math.sqrt(t / max(1e-12, f[c]))) for c in classes_}
-        w = np.array([r[row.cell_type] for row in df.itertuples()], dtype=np.float32)
-        return WeightedRandomSampler(torch.from_numpy(w), num_samples=N, replacement=True)
-
-    train_loader_rfs = None
-    rfs_prestage = False if tau_target == 0.0 else rfs_prestage
-    if rfs_prestage:
-        try:
-            rfs_sampler = _build_rfs_sampler(train_ds.df, classes, t=rfs_t)
-            train_loader_rfs = DataLoader(
-                train_ds, batch_size=args.batch_size, sampler=rfs_sampler,
-                shuffle=False, num_workers=args.num_workers, worker_init_fn=worker_init,
-                pin_memory=True, persistent_workers=pw, drop_last=True
-            )
-            print(f"RFS pre-stage enabled (t={rfs_t}).")
-        except Exception as e:
-            print(f"Warning: failed to build RFS sampler ({e}); falling back to shuffle.")
-            train_loader_rfs = None
+    if smooth_on and (not debug_mode):
+        # Correct per-example weighting so that class sampling prob ∝ n_c**alpha
+        vc = train_ds.df[label_col].value_counts()
+        n = np.array([int(vc.get(c, 0)) for c in classes], dtype=np.float64)
+        n = np.clip(n, 1.0, None)
+        # per-example weight
+        w_per_class = n ** (smooth_alpha - 1.0)
+        w_map = {c: w_per_class[i] for i, c in enumerate(classes)}
+        w = torch.tensor([w_map[cell_type] for cell_type in train_ds.df[label_col]],dtype=torch.float32)
+        num_samples = epoch_budget if epoch_budget > 0 else len(train_ds)
+        # quick implied share print for head and tail sanity
+        implied = (n * w_per_class)
+        implied = implied / implied.sum()
+        head_i = int(np.argmax(n)); tail_i = int(np.argmin(n))
+        print(f"Smoothing alpha={smooth_alpha:.2f} implied share  "
+              f"head {classes[head_i]}={implied[head_i]:.4f}  "
+              f"tail {classes[tail_i]}={implied[tail_i]:.4f}  "
+              f"budget={num_samples if epoch_budget>0 else 'full'}")
+        smooth_sampler = WeightedRandomSampler(w, num_samples=num_samples, replacement=True)
+        train_loader_smooth = DataLoader(
+            train_ds, batch_size=args.batch_size, sampler=smooth_sampler, shuffle=False,
+            num_workers=args.num_workers, worker_init_fn=worker_init,
+            pin_memory=pin, persistent_workers=pw_flag, drop_last=True
+        )
+    
 
     # label smoothing will be ramped in sync with LA
     ls_target = 0.05
@@ -300,16 +350,42 @@ def main():
             head_scale_params.append(p)
         else:
             head_weight_params.append(p)
-
-    optim_groups = [
-        {"params": lora_params,        "lr": args.lr_lora, "weight_decay": 0.0},
-        {"params": head_weight_params, "lr": args.lr_head, "weight_decay": 1e-4},
-        {"params": head_scale_params,  "lr": args.lr_head, "weight_decay": 0.0},  # no decay on temperature
-        {"params": norms,              "lr": args.lr_head, "weight_decay": 1e-4},
-    ]
+            
+    if debug_mode:
+        optim_groups = [
+            {"params": lora_params, "lr": args.lr_lora, "weight_decay": 0.0},
+            {"params": model.head.parameters(), "lr": args.lr_head, "weight_decay": 0.0},
+            {"params": norms, "lr": args.lr_head, "weight_decay": 0.0},
+        ]
+    else:
+        if unfreeze:
+            # backbone = all trainable params except head
+            head_param_set = set(p for p in model.head.parameters())
+            backbone_params = [p for p in model.parameters() if p.requires_grad and p not in head_param_set]
+            optim_groups = [
+                {"params": backbone_params,    "lr": args.lr_backbone, "weight_decay": 5e-2},
+                {"params": head_weight_params, "lr": args.lr_head,     "weight_decay": 1e-4},
+                {"params": head_scale_params,  "lr": args.lr_head,     "weight_decay": 0.0},
+            ]
+        else:
+            optim_groups = [
+                {"params": lora_params,        "lr": args.lr_lora, "weight_decay": 0.0},
+                {"params": head_weight_params, "lr": args.lr_head, "weight_decay": 1e-4},
+                {"params": head_scale_params,  "lr": args.lr_head, "weight_decay": 0.0},  # no decay on temperature
+                {"params": norms,              "lr": args.lr_head * 0.2, "weight_decay": 1e-4},
+            ]
     optimizer = torch.optim.AdamW(optim_groups)
+    
+    head_w_set = set(head_weight_params)
+    head_s_set = set(head_scale_params)
+    lora_set   = set(lora_params) if isinstance(lora_params, list) else set()
+    backbone_set = set()
+    if unfreeze:
+        head_param_set = set(p for p in model.head.parameters())
+        backbone_set = set(p for p in model.parameters() if p.requires_grad and p not in head_param_set)
+    
 
-    if args.cosine:
+    if args.cosine and not debug_mode:
         total_epochs = args.epochs
         warmup = max(0, min(args.warmup_epochs, total_epochs - 1))
 
@@ -337,7 +413,7 @@ def main():
     wandb_mod, wb_run = maybe_init_wandb(args, classes, run_id, args.out_dir)
 
     print("\nStarting training (single GPU)...")
-    print("Using cosine head and logit adjusted cross entropy (with ramp)")
+    print("Using cosine head and " + ("logit-adjusted CE (with ramp)" if tau_target>0 else "plain CE (no LA)"))
     print(f"LRs: head={args.lr_head}  lora={args.lr_lora}  | cosine_schedule={args.cosine} warmup={args.warmup_epochs}\n")
 
     params_to_clip = [p for g in optimizer.param_groups for p in g['params'] if p.requires_grad]
@@ -346,17 +422,13 @@ def main():
         t0 = time.time()
         model.train()
 
-        # Choose loader: if LA is off and rfs_all_epochs is true, keep RFS for all epochs
-        if tau_target == 0.0 and rfs_all_epochs and train_loader_rfs is not None:
-            train_loader = train_loader_rfs
-            if epoch == 1:
-                print("Using RFS sampler for ALL epochs (LA disabled).")
-        elif epoch < la_start_epoch and train_loader_rfs is not None:
-            train_loader = train_loader_rfs
-            if epoch == 1:
-                print("Using RFS sampler for pre-stage epochs.")
+        if debug_mode:
+            train_loader = DataLoader(
+                train_ds, batch_size=args.batch_size, shuffle=True,
+                num_workers=args.num_workers, 
+                pin_memory=pin, drop_last=True)
         else:
-            train_loader = train_loader_shuffle
+            train_loader = train_loader_smooth if (smooth_on and train_loader_smooth is not None) else train_loader_shuffle
 
         # ---- build epoch-wise effective adjustment and smoothing ----
         if epoch < la_start_epoch:
@@ -383,8 +455,15 @@ def main():
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type='cuda', dtype=amp_dtype, enabled=torch.cuda.is_available()):
                 logits = model(x)
-                logits_eff = logits - adj.to(dtype=logits.dtype) if tau_eff > 0 else logits
-                loss = F.cross_entropy(logits_eff, y, label_smoothing=label_smoothing)
+                
+                if debug_mode:
+                    # plain CE, no logit adjustment
+                    logits_eff = logits
+                    loss = F.cross_entropy(logits_eff, y)
+                else:
+                    # effective adjusted logits for this epoch
+                    logits_eff = logits - adj.to(dtype=logits.dtype) if tau_eff > 0 else logits
+                    loss = F.cross_entropy(logits_eff, y, label_smoothing=label_smoothing)
 
             scaler.scale(loss).backward()
 
@@ -502,9 +581,10 @@ def main():
                   f"(val_loss_raw {val_loss_raw:.4f}  val_acc_raw {val_acc_raw:.3f})  "
                   f"| tau_eff {tau_eff:.3f}  ls {label_smoothing:.3f} |  {secs:.1f}s")
 
-        # Log metrics CSV
-        lr_lora = optimizer.param_groups[0]["lr"]
-        lr_head = optimizer.param_groups[1]["lr"] if len(optimizer.param_groups) > 1 else lr_lora
+        # log CSV
+        lr_head = _find_group_lr(optimizer, head_w_set) or 0.0
+        lr_lora = _find_group_lr(optimizer, lora_set) or 0.0
+        lr_backbone = _find_group_lr(optimizer, backbone_set) or 0.0
         log_metrics(
             metrics_w, run_id, epoch, train_loss, train_acc, val_loss_adj, val_acc_adj,
             lr_head, lr_lora, secs, per_class_metrics, classes
@@ -513,6 +593,10 @@ def main():
 
         # W&B logging
         if wb_run is not None:
+            lr_head_w = _find_group_lr(optimizer, head_w_set) or 0.0
+            lr_head_s = _find_group_lr(optimizer, head_s_set) or 0.0
+            lr_lora_v = _find_group_lr(optimizer, lora_set) or 0.0
+            lr_bb     = _find_group_lr(optimizer, backbone_set) or 0.0
             m_f1 = 0.0
             if 'macro_f1' in locals() and macro_f1 is not None and not np.isnan(macro_f1):
                 m_f1 = float(macro_f1)
@@ -524,7 +608,9 @@ def main():
                 "val/macro_f1": m_f1,
                 "la/tau_eff": tau_eff, "la/tau_target": tau_target,
                 "la/label_smoothing": label_smoothing,
-                "lr/head": lr_head, "lr/lora": lr_lora,
+                "lr/head": lr_head, 
+                "lr/head_w": lr_head_w, "lr/head_s": lr_head_s,
+                "lr/lora": lr_lora_v, "lr/backbone": lr_bb,
                 "time/epoch_sec": secs
             }, step=epoch)
 

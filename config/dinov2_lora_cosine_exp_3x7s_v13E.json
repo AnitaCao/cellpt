@@ -1,0 +1,35 @@
+{
+    "train_csv": "/hpc/group/jilab/rz179/cellpt/combined/7s/3xZoomed/combined_meta_uniform3x7s_selected_train.csv",
+    "val_csv":   "/hpc/group/jilab/rz179/cellpt/combined/7s/3xZoomed/combined_meta_uniform3x7s_selected_val.csv",
+    "class_map": "/hpc/group/jilab/rz179/cellpt/combined/7s/class_to_idx_selected_7s.json",
+  
+    "out_dir":   "/hpc/group/jilab/rz179/cellpt/experiments/dinov2_lora_uniform3x7s_cosinehead_v13e",
+    "model":     "vit_base_patch14_dinov2",
+  
+    "img_size": 224,
+    "batch_size": 96,
+    "epochs": 70,
+    "num_workers": 8,
+    "seed": 23,
+    "use_img_uniform": true,
+  
+    "cosine": true,
+    "warmup_epochs": 10,
+  
+    "lr_head": 0.002,
+    "lr_lora": 0.0005,
+    "weight_decay": 0.0001,
+  
+    "lora_blocks": 6,
+    "lora_rank": 16,
+    "lora_alpha": 32,
+    "lora_dropout": 0.10,
+  
+    "logit_tau": 0.8,
+    "la_start_epoch": 8,
+    "la_ramp_epochs": 15,
+  
+    "prior_csv": "/hpc/group/jilab/rz179/cellpt/combined/7s/3xZoomed/combined_meta_uniform3x7s_selected_train.csv",
+    "save_args": true
+  }
+  

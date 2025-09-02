@@ -16,6 +16,14 @@ def add_common_args(p: argparse.ArgumentParser):
     p.add_argument("--img_size", type=int, default=224)
     p.add_argument("--use_weighted_sampler", action="store_true",
                     help="Use WeightedRandomSampler for the training DataLoader")
+    p.add_argument("--label_col", type=str, default="cell_type")
+    p.add_argument("--prior_csv", type=str, default=None,
+                   help="Optional CSV to compute class priors for logit adjustment")
+    
+    p.add_argument("--unfreeze_backbone", action="store_true",
+                   help="Unfreeze the whole backbone for full finetuning (skip LoRA)")
+    p.add_argument("--lr_backbone", type=float, default=1e-4,
+                   help="Backbone LR when unfreeze_backbone is set")
 
 
     # model / training
@@ -45,6 +53,11 @@ def add_lora_args(p: argparse.ArgumentParser):
     p.add_argument("--lora_blocks", type=int, default=6)
     p.add_argument("--lora_dropout", type=float, default=0.0)
     p.add_argument("--logit_tau", type=float, default=0.1)
+    
+    p.add_argument("--la_start_epoch", type=int, default=3,
+                   help="Epoch to start logit adjustment")  
+    p.add_argument("--la_ramp_epochs", type=int, default=3,
+                   help="Epochs to ramp up logit adjustment")
     return p
 
 

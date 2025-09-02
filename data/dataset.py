@@ -46,81 +46,65 @@ class AddGaussianNoise(nn.Module):
 # Cell Core Dataset
 # -----------------------------
 class NucleusCSV(Dataset):
-    def __init__(self, csv_path, class_to_idx: Dict[str,int], mean, std, size, use_img_uniform=False, augment=False):
+    def __init__(self, csv_path, class_to_idx: dict, mean, std, size,
+                 label_col, use_img_uniform=False, augment=False):
         df = pd.read_csv(csv_path)
-        self.df = df.copy()
 
-        # choose column
+        # pick path column
         if use_img_uniform:
-            if "img_path_uniform" in df.columns:
-                print(f"Using 'img_path_uniform' column from {csv_path} for images.")
-                col = "img_path_uniform"
-            else:
-                raise RuntimeError(f"Column 'img_path_uniform' not found in {csv_path}. ")
-        else:   
-            col = "img_path"
-        #col = "img_path.1" if use_img_uniform and "img_path.1" in df.columns else "img_path"
-        if col not in df.columns:
-            raise RuntimeError(f"Column '{col}' not found in {csv_path}")
+            if "img_path_uniform" not in df.columns:
+                raise RuntimeError(f"Column 'img_path_uniform' not found in {csv_path}")
+            path_col = "img_path_uniform"
+            print(f"Using 'img_path_uniform' column from {csv_path} for images.")
+        else:
+            path_col = "img_path"
+            if path_col not in df.columns:
+                raise RuntimeError(f"Column '{path_col}' not found in {csv_path}")
 
-        # keep only rows with existing files and allowed labels
-        self.df = self.df[self.df[col].map(lambda p: Path(str(p)).is_file())]
-        if "skipped_reason" in self.df.columns:
-            self.df = self.df[self.df["skipped_reason"].fillna("") == ""]
-        if "cell_type" not in self.df.columns:
-            raise RuntimeError("CSV missing 'cell_type' column")
+        if label_col not in df.columns:
+            raise RuntimeError(f"CSV missing label column '{label_col}'")
+
+        # keep rows with existing files and allowed labels
+        df = df[df[path_col].map(lambda p: Path(str(p)).is_file())]
+        if "skipped_reason" in df.columns:
+            df = df[df["skipped_reason"].fillna("") == ""]
 
         allowed = set(class_to_idx.keys())
-        self.df = self.df[self.df["cell_type"].isin(allowed)].reset_index(drop=True)
+        df = df[df[label_col].isin(allowed)].reset_index(drop=True)
 
-        self.path_col = col
+        # save fields
+        self.df = df.copy()
+        self.path_col = path_col
+        self.label_col = label_col
         self.class_to_idx = class_to_idx
 
         # transforms
-        self.size = size  
+        self.size = size
         mean = IMAGENET_DEFAULT_MEAN if mean is None else mean
         std  = IMAGENET_DEFAULT_STD  if std  is None else std
-        
         erase_value = tuple((-(np.array(mean)/np.array(std))).tolist())
-        
+
         base = [
             transforms.Resize((self.size, self.size), interpolation=IM.BICUBIC, antialias=True),
-            transforms.ToTensor(),  # HWC [0..255] -> CHW [0..1]
+            transforms.ToTensor(),
             transforms.Lambda(lambda x: x.expand(3, *x.shape[1:]) if x.shape[0] == 1 else x),
             transforms.Normalize(mean, std),
         ]
+
         if augment:
             pre_aug = [
-                #RandomCenterZoom(0.98, 1.00),
-
                 transforms.RandomHorizontalFlip(p=0.5),
                 transforms.RandomVerticalFlip(p=0.5),
-
-                # small rotation; fill black to match background
-                transforms.RandomApply([
-                    transforms.RandomRotation(8, interpolation=IM.BILINEAR, fill=0)
-                ], p=0.5),
-
-                # tiny translation/scale to simulate slight placement/size variation
-                transforms.RandomApply([
-                    transforms.RandomAffine(
-                        degrees=0, translate=(0.05, 0.05), shear=0,
-                        interpolation=IM.BILINEAR, fill=0
-                    )
-                ], p=0.5),
-
+                transforms.RandomApply([transforms.RandomRotation(8, interpolation=IM.BILINEAR, fill=0)], p=0.5),
+                transforms.RandomApply([transforms.RandomAffine(degrees=0, translate=(0.05, 0.05),
+                                                                interpolation=IM.BILINEAR, fill=0)], p=0.5),
                 transforms.ColorJitter(brightness=0.2, contrast=0.2),
-
-                transforms.RandomApply([
-                    transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0))
-                ], p=0.2),
+                transforms.RandomApply([transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0))], p=0.2),
             ]
-            # value=0 fills with the per-channel MEAN in normalized space (x=0),
             self.tx = transforms.Compose(
                 pre_aug + base + [
-                    transforms.RandomErasing(
-                        p=0.25, scale=(0.02, 0.06), ratio=(0.3, 3.3), value=erase_value, inplace=True
-                    )
+                    transforms.RandomErasing(p=0.15, scale=(0.02, 0.06), ratio=(0.3, 3.3),
+                                             value=0.0, inplace=True)
                 ]
             )
         else:
@@ -131,16 +115,14 @@ class NucleusCSV(Dataset):
 
     def __getitem__(self, i):
         row = self.df.iloc[i]
-        img = Image.open(row[self.path_col]).convert("L")  # grayscale
+        img = Image.open(row[self.path_col]).convert("L")
         x = self.tx(img)
-        y = self.class_to_idx[row.cell_type]
+        y = self.class_to_idx[row[self.label_col]]
         return x, y
 
 
 
-
-
-
+# -----------------------------
 class ArrowImageDataset(Dataset):
     def __init__(self, hf_dataset, transform=None):
         self.dataset = hf_dataset
