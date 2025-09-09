@@ -37,9 +37,26 @@ def add_common_args(p: argparse.ArgumentParser):
     p.add_argument("--cosine", action="store_true")
     p.add_argument("--warmup_epochs", type=int, default=3)
     p.add_argument("--weight_decay", type=float, default=0.05)
+    p.add_argument("--label_smoothing", type=float, default=0.0)
+
+    # Mixup / CutMix (Stage-1 augmentation)
+    p.add_argument("--mixup_alpha", type=float, default=0.0,
+                   help="Mixup alpha; 0 to disable")
+    p.add_argument("--cutmix_alpha", type=float, default=0.0,
+                   help="CutMix alpha; 0 to disable")
+    p.add_argument("--mixup_prob", type=float, default=1.0,
+                   help="Probability to apply mixup/cutmix per batch")
+    p.add_argument("--mixup_switch_prob", type=float, default=0.0,
+                   help="Probability to switch between mixup/cutmix in a batch")
+    p.add_argument("--mixup_mode", type=str, default="batch",
+                   help="Mixup application mode (batch, pair, elem)")
+    p.add_argument("--mixup_off_epochs", type=int, default=10,
+                   help="Turn OFF mixup/cutmix for the last K epochs")
 
     # config plumbing
     p.add_argument("--config", type=str, help="Path to JSON config with defaults")
+    p.add_argument("--save_metric", type=str, default="acc",
+                   help="Metric to use for model selection")
     p.add_argument("--save_args", action="store_true",
                    help="Write merged args to out_dir/args.resolved.json")
     return p
