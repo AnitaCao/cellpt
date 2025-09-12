@@ -32,12 +32,38 @@ def add_common_args(p: argparse.ArgumentParser):
     p.add_argument("--batch_size", type=int, default=256)
     p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--sampler", choices=["none", "weighted"], default="weighted")
+    # Explicit base sampler: 'uniform' (shuffle) or 'weighted' (1/n_c).
+    p.add_argument("--sampler", choices=["uniform", "weighted"], default="uniform")
 
     p.add_argument("--cosine", action="store_true")
     p.add_argument("--warmup_epochs", type=int, default=3)
     p.add_argument("--weight_decay", type=float, default=0.05)
     p.add_argument("--label_smoothing", type=float, default=0.0)
+    
+    # --- Imbalance control (per-class cap) ---
+    p.add_argument("--cap_ratio", type=float, default=0.0,
+                   help="If > 0: cap each class count in TRAIN to cap_ratio * base_count (see --cap_base). "
+                        "Applied after JSON filtering and optional head downsample; 0 disables.")
+    p.add_argument("--cap_base", type=str, default="min", choices=["min","p1","p5","p10"],
+                   help="Base count for ratio cap: min (default) or low percentile of TRAIN class counts.")
+
+    
+    
+    # --- Imbalance-aware loss switches ---
+    p.add_argument('--loss_type', default='ce',
+                   choices=['ce', 'cb_focal', 'ldam_drw'],
+                   help="Classification loss: cross-entropy (ce), class-balanced focal (cb_focal), or LDAM with DRW (ldam_drw)")
+    p.add_argument('--focal_gamma', type=float, default=1.5)
+    p.add_argument('--cb_beta', type=float, default=0.9999,
+                   help="CB effective-number beta; 0.9999 is standard for long-tailed data")
+    p.add_argument('--ldam_max_m', type=float, default=0.5,
+                   help="LDAM max margin")
+    p.add_argument('--ldam_s', type=float, default=30.0,
+                   help="LDAM scaling factor")
+    p.add_argument('--drw_start_epoch', type=int, default=15,
+                   help="Start epoch for DRW reweighting (effective-number class weights)")
+
+    
 
     # Mixup / CutMix (Stage-1 augmentation)
     p.add_argument("--mixup_alpha", type=float, default=0.0,
