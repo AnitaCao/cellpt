@@ -58,6 +58,7 @@ class NucleusCSV(Dataset):
             print(f"Using 'img_path_uniform' column from {csv_path} for images.")
         else:
             path_col = "img_path"
+            print(f"Using 'img_path' column from {csv_path} for images.")
             if path_col not in df.columns:
                 raise RuntimeError(f"Column '{path_col}' not found in {csv_path}")
 
