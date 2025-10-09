@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import math
 from typing import Optional
 import numpy as np
@@ -62,6 +61,7 @@ class LDAMLoss(nn.Module):
     def forward(self, logits: torch.Tensor, targets: torch.Tensor, epoch: Optional[int] = None) -> torch.Tensor:
         # Subtract margin on the true class logits
         margins = self.m_list[targets]  # [B]
+        margins = margins.to(logits.dtype) 
         x = logits.clone()
         idx = torch.arange(x.size(0), device=x.device)
         x[idx, targets] = x[idx, targets] - margins
