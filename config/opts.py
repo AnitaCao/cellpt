@@ -24,6 +24,8 @@ def add_common_args(p: argparse.ArgumentParser):
                    help="Unfreeze the whole backbone for full finetuning (skip LoRA)")
     p.add_argument("--lr_backbone", type=float, default=1e-4,
                    help="Backbone LR when unfreeze_backbone is set")
+    p.add_argument("--use_slide_mask", type=bool, default=False,)
+    p.add_argument("--val_style", type=str, default="bal",)
 
 
     # model / training
@@ -39,6 +41,41 @@ def add_common_args(p: argparse.ArgumentParser):
     p.add_argument("--warmup_epochs", type=int, default=3)
     p.add_argument("--weight_decay", type=float, default=0.05)
     p.add_argument("--label_smoothing", type=float, default=0.0)
+    
+    # Two-channel and metadata
+    # =========================
+    p.add_argument("--input_mode", type=str, default="rt",
+                   choices=["raw", "rt"],
+                   help="raw: grayscale expanded to 3, rt: [raw, target_mask] two-channel")
+    p.add_argument("--mask_target_col", type=str, default="mask_target_img_path",
+                   help="CSV column with target mask image path when input_mode=rt")
+    p.add_argument("--mask_from_masked_images", type=int, default=1,
+                   help="1 to threshold mask image to binary, 0 to use as-is")
+    p.add_argument("--mask_threshold", type=int, default=0,
+                   help="threshold for binarizing mask when mask_from_masked_images=1")
+    p.add_argument("--slide_col", type=str, default="slide_id",
+                   help="CSV column for slide id")
+    p.add_argument("--coarse_col", type=str, default="cell_type_coarse",
+                   help="CSV column for coarse label")
+
+    # =========================
+    # Coarse auxiliary head
+    # =========================
+    p.add_argument("--use_coarse_aux", type=int, default=0,
+                   help="1 to add a coarse head and soft gating, 0 to disable")
+    p.add_argument("--hier_alpha", type=float, default=0.2,
+                   help="gating strength added to fine logits")
+    p.add_argument("--hier_warmup_epochs", type=int, default=3,
+                   help="epochs to ramp hier_alpha from 0 to target")
+    p.add_argument("--coarse_loss_weight", type=float, default=0.3,
+                   help="auxiliary loss weight for coarse head")
+     # coarse head selection
+    p.add_argument('--coarse_head_mlp', type=int, default=0,
+                   help='1 = use MLP coarse head (default: 0 linear)')
+    p.add_argument('--coarse_mlp_hidden', type=int, default=0,
+                   help='hidden size for MLP (0=auto=max(D,256))')
+    p.add_argument('--coarse_mlp_dropout', type=float, default=0.0,
+                   help='dropout for CoarseHeadMLP')
     
     # --- Imbalance control (per-class cap) ---
     p.add_argument("--cap_ratio", type=float, default=0.0,
@@ -103,6 +140,17 @@ def add_lora_args(p: argparse.ArgumentParser):
                    help="Epochs to ramp up logit adjustment")
     return p
 
+
+def add_multiview_args(parser):
+    g = parser.add_argument_group("multi-view")
+    g.add_argument("--multi_view", type=int, default=0, help="Use paired multi-FOV inputs (2.5x + 5x).")
+    g.add_argument("--train_csv_view1", type=str, default="", help="CSV for 2.5x train images")
+    g.add_argument("--train_csv_view2",  type=str, default="", help="CSV for 5x   train images")
+    g.add_argument("--val_csv_view1",   type=str, default="", help="CSV for 2.5x val images")
+    g.add_argument("--val_csv_view2",    type=str, default="", help="CSV for 5x   val images")
+    g.add_argument("--mv_gate_entropy_w", type=float, default=0.1, help="Entropy reg for gate (decays over warmup)")
+    g.add_argument("--mv_warmup_epochs", type=int, default=3, help="Gate entropy warmup length")
+    return parser
 
 # -----------------------------
 # Parser builder + parse
