@@ -19,6 +19,11 @@ outputs/
 # W&B cache
 wandb/
 
+*.err
+*.out
+
+plots/
+
 # Jupyter checkpoints
 .ipynb_checkpoints/
 
