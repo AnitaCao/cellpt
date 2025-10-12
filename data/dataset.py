@@ -45,104 +45,18 @@ class AddGaussianNoise(nn.Module):
 # -----------------------------
 # Cell Core Dataset
 # -----------------------------
-class NucleusCSV_(Dataset):
-    def __init__(self, csv_path, class_to_idx: dict, mean, std, size,
-                 label_col, use_img_uniform=False,  augment=False):
-        df = pd.read_csv(csv_path)
-
-        # pick path column
-        if use_img_uniform:
-            if "img_path_uniform" not in df.columns:
-                raise RuntimeError(f"Column 'img_path_uniform' not found in {csv_path}")
-            path_col = "img_path_uniform"
-        else:
-            path_col = "img_path"
-            if path_col not in df.columns:
-                path_col = "raw_img_path"
-                if path_col not in df.columns:
-                    raise RuntimeError(f"CSV missing path column 'img_path' or 'raw_img_path'")
-
-        print(f"Using path column '{path_col}' from {csv_path} for images.")
-        
-        if label_col not in df.columns:
-            raise RuntimeError(f"CSV missing label column '{label_col}'")
-
-        # keep rows with existing files and allowed labels
-        df = df[df[path_col].map(lambda p: Path(str(p)).is_file())]
-        if "skipped_reason" in df.columns:
-            df = df[df["skipped_reason"].fillna("") == ""]
-
-        allowed = set(class_to_idx.keys())
-        df = df[df[label_col].isin(allowed)].reset_index(drop=True)
-
-        # save fields
-        self.df = df.copy()
-        self.path_col = path_col
-        self.label_col = label_col
-        self.class_to_idx = class_to_idx
-
-
-        # transforms
-        self.size = size
-        mean = IMAGENET_DEFAULT_MEAN if mean is None else mean
-        std  = IMAGENET_DEFAULT_STD  if std  is None else std
-        erase_value = tuple((-(np.array(mean)/np.array(std))).tolist())
-
-        base = [
-            transforms.Resize((self.size, self.size), interpolation=IM.BICUBIC, antialias=True),
-            transforms.ToTensor(),
-            transforms.Lambda(lambda x: x.expand(3, *x.shape[1:]) if x.shape[0] == 1 else x),
-            transforms.Normalize(mean, std),
-        ]
-
-        if augment:
-            pre_aug = [
-                transforms.RandomHorizontalFlip(p=0.5),
-                transforms.RandomVerticalFlip(p=0.5),
-                transforms.RandomApply([transforms.RandomRotation(8, interpolation=IM.BILINEAR, fill=0)], p=0.5),
-                transforms.RandomApply([transforms.RandomAffine(degrees=0, translate=(0.05, 0.05),
-                                                                interpolation=IM.BILINEAR, fill=0)], p=0.5),
-                transforms.ColorJitter(brightness=0.2, contrast=0.2),
-                transforms.RandomApply([transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0))], p=0.2),
-            ]
-            self.tx = transforms.Compose(
-                pre_aug + base + [
-                    transforms.RandomErasing(p=0.15, scale=(0.02, 0.06), ratio=(0.3, 3.3),
-                                             value=0.0, inplace=True)
-                ]
-            )
-        else:
-            self.tx = transforms.Compose(base)
-
-    def __len__(self):
-        return len(self.df)
-
-    def __getitem__(self, i):
-        row = self.df.iloc[i]
-        img = Image.open(row[self.path_col]).convert("L")
-        x = self.tx(img)
-        y = self.class_to_idx[row[self.label_col]]
-        return x, y
-
 
 
 class NucleusCSV(Dataset):
     def __init__(self, csv_path, class_to_idx: dict, mean, std, size,
-                 label_col, use_img_uniform=False, augment=False,
+                 label_col, augment=False,
                  return_slide: bool = False):
-        df = pd.read_csv(csv_path)
-
-        # pick path column
-        if use_img_uniform:
-            if "img_path_uniform" not in df.columns:
-                raise RuntimeError(f"Column 'img_path_uniform' not found in {csv_path}")
-            path_col = "img_path_uniform"
-        else:
-            path_col = "img_path"
+        df = pd.read_csv(csv_path) 
+        path_col = "img_path"
+        if path_col not in df.columns:
+            path_col = "raw_img_path"
             if path_col not in df.columns:
-                path_col = "raw_img_path"
-                if path_col not in df.columns:
-                    raise RuntimeError(f"CSV missing path column 'img_path' or 'raw_img_path'")
+                raise RuntimeError(f"CSV missing path column 'img_path' or 'raw_img_path'")
 
         print(f"Using path column '{path_col}' from {csv_path} for images.")
         
@@ -269,7 +183,6 @@ class PairedMultiFOV(Dataset):
         key_col: str = "cell_id",          # if not in both, will fall back to stem
         slide_col: str = "slide_id",
         augment: bool = False,
-        use_img_uniform: bool = False,     # if True, prefer 'img_path_uniform' when available
     ):
         self.size = int(size)
         self.label_col = label_col
@@ -282,8 +195,6 @@ class PairedMultiFOV(Dataset):
 
         # Decide path column per CSV (mirrors your NucleusCSV logic)
         def choose_path_col(df):
-            if use_img_uniform and "img_path_uniform" in df.columns:
-                return "img_path_uniform"
             for c in path_cols:
                 if c in df.columns:
                     return c
@@ -329,6 +240,23 @@ class PairedMultiFOV(Dataset):
 
         # Keep handy column names
         self.pa, self.pb = pa, pb
+        
+        nA, nB, nP = len(A), len(B), len(self.join)
+        print(f"[PairedMultiFOV] paired={nP}  from A={nA} B={nB}")
+        if nP == 0:
+            raise RuntimeError("[PairedMultiFOV] No pairs found. Check key_col/stems, paths, or labels.")
+        
+        # --- expose a canonical df for trainers expecting NucleusCSV-like API
+        label_a = f"{label_col}_a"
+        slide_a = f"{slide_col}_a"
+        cols = {}
+        cols[label_col] = self.join[label_a].reset_index(drop=True)
+        if slide_a in self.join.columns:
+            cols["slide_id"] = self.join[slide_a].reset_index(drop=True)
+        else:
+            # fallback: empty strings if slide ids missing
+            cols["slide_id"] = pd.Series([""] * len(self.join))
+        self.df = pd.DataFrame(cols)
 
         # Transforms: same as your NucleusCSV, but we apply **paired** geom augs
         mean = IMAGENET_DEFAULT_MEAN if mean is None else mean
@@ -354,9 +282,12 @@ class PairedMultiFOV(Dataset):
 
     def __getitem__(self, i):
         row = self.join.iloc[i]
-        pa = row[f"{self.pa}_a"] if self.key_mode == "key" else row[f"{self.pa}_a"]
-        pb = row[f"{self.pb}_b"] if self.key_mode == "key" else row[f"{self.pb}_b"]
+        pa_col = f"{self.pa}_a"
+        pb_col = f"{self.pb}_b"
+        pa = row[pa_col]
+        pb = row[pb_col]
 
+        slide_a = f"{self.slide_col}_a"
         # load
         ia = Image.open(pa).convert("L")
         ib = Image.open(pb).convert("L")
@@ -377,8 +308,9 @@ class PairedMultiFOV(Dataset):
         xb = self.post(ib)  # [C,H,W]
         x = torch.stack([xa, xb], dim=0)  # [2,C,H,W]
 
-        y = self.class_to_idx[row[f"{self.label_col}_a" if self.key_mode=="key" else f"{self.label_col}_a"]]
-        sid = row.get(f"{self.slide_col}_a", "")  # safe if slide_id missing
+        y = self.class_to_idx[row[f"{self.label_col}_a"]]
+        
+        sid = row[slide_a] if slide_a in self.join.columns else ""
 
         return x, y, sid
 

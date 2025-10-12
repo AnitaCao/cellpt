@@ -536,15 +536,6 @@ def worker_init_fn(seed: int) -> Callable[[int], None]:
     return _init
 
 
-def find_group_lr(optimizer: torch.optim.Optimizer, param_set: Iterable[torch.nn.Parameter]) -> float | None:
-    """Return lr of the first param group that contains any param from param_set."""
-    ps = set(param_set)
-    for g in optimizer.param_groups:
-        # Torch wraps params as a list. Membership check on ids is robust.
-        if any((p in ps) for p in g["params"]):
-            return float(g.get("lr", 0.0))
-    return None
-
 
 def apply_slide_mask(logits: torch.Tensor,
                      slide_ids: List[str] | None,
@@ -869,54 +860,112 @@ def create_scheduler(args, optimizer) -> torch.optim.lr_scheduler._LRScheduler |
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
+def find_group_lr(optimizer: torch.optim.Optimizer, param_set: Iterable[torch.nn.Parameter]) -> float | None:
+    """Return lr of the first param group that contains any param from param_set (by identity)."""
+    target_ids = {id(p) for p in param_set}
+    for g in optimizer.param_groups:
+        if any(id(p) in target_ids for p in g["params"]):
+            return float(g.get("lr", 0.0))
+    return None
+
+
 def build_optimizer(model: torch.nn.Module,
                     args,
                     lora_params,
                     norms,
                     head_weight_params,
                     head_scale_params) -> torch.optim.Optimizer:
+    """AdamW with grouped LRs. Ensures groups are disjoint by identity."""
     unfreeze = bool(getattr(args, "unfreeze_backbone", False))
 
-    coarse_head = getattr(model, "coarse_head", None)
-    coarse_set = set(coarse_head.parameters()) if coarse_head is not None else set()
+    # helpers
+    def uniq(params):
+        seen, out = set(), []
+        for p in params:
+            if p is None: continue
+            pid = id(p)
+            if pid not in seen:
+                out.append(p); seen.add(pid)
+        return out
+
+    # collect sets by identity
+    all_trainable = [p for p in model.parameters() if p.requires_grad]
+
+    head_w_ids  = {id(p) for p in uniq(head_weight_params)}
+    head_s_ids  = {id(p) for p in uniq(head_scale_params)}
+    lora_ids    = {id(p) for p in uniq(lora_params)}
+    norm_ids    = {id(p) for p in uniq(norms)}
+
+    # detect extra heads and add them to head_w set if present
+    if hasattr(model, "coarse_head"):
+        for p in model.coarse_head.parameters():
+            head_w_ids.add(id(p))
+    if hasattr(model, "scale_gate"):
+        for p in model.scale_gate.parameters():
+            head_w_ids.add(id(p))
+
+    used = set()
+
+    def take(ids_set, base_iter=None):
+        base = all_trainable if base_iter is None else base_iter
+        picked = []
+        for p in base:
+            pid = id(p)
+            if pid in ids_set and pid not in used:
+                picked.append(p); used.add(pid)
+        return picked
+
+    # build disjoint groups in a stable order
+    groups = []
 
     if unfreeze:
-        head_param_set = set(p for p in getattr(model, "_cosine_head").parameters())
-        # exclude both heads from backbone
-        exclude = head_param_set | coarse_set
-        backbone_params = [p for p in model.parameters()
-                           if p.requires_grad and p not in exclude]
-        optim_groups = [
-            {"params": backbone_params,             "lr": float(args.lr_backbone), "weight_decay": 5e-2},
-            {"params": list(head_weight_params),    "lr": float(args.lr_head),     "weight_decay": 1e-4},
-            {"params": list(head_scale_params),     "lr": float(args.lr_head),     "weight_decay": 0.0},
-        ]
-        if coarse_head is not None:
-            optim_groups.append(
-                {"params": list(coarse_head.parameters()), "lr": float(args.lr_head), "weight_decay": 1e-4}
-            )
+        # backbone = everything trainable not explicitly assigned to heads/lora/norms
+        # heads come first so backbone won't grab them
+        group_head_w = take(head_w_ids)
+        group_head_s = take(head_s_ids)
+        # no lora group typically when unfreezing ViT, but still subtract them from backbone if present
+        group_lora   = take(lora_ids)
+        group_norms  = take(norm_ids)  # if any norms require grad
+        group_backbone = [p for p in all_trainable if id(p) not in used and (used.add(id(p)) or True)]
+
+        if group_backbone:
+            groups.append({"params": group_backbone, "lr": float(getattr(args, "lr_backbone", 0.0)), "weight_decay": 5e-2})
+        if group_head_w:
+            groups.append({"params": group_head_w, "lr": float(getattr(args, "lr_head", 1e-3)), "weight_decay": 1e-4})
+        if group_head_s:
+            groups.append({"params": group_head_s, "lr": float(getattr(args, "lr_head", 1e-3)), "weight_decay": 0.0})
+        if group_lora:
+            groups.append({"params": group_lora, "lr": float(getattr(args, "lr_lora", 1e-4)), "weight_decay": 0.0})
+        if group_norms:
+            groups.append({"params": group_norms, "lr": float(getattr(args, "lr_backbone", 0.0)), "weight_decay": 0.0})
     else:
-        wd = float(getattr(args, "weight_decay", 5e-2))
-        optim_groups = [
-            {"params": list(lora_params),           "lr": float(args.lr_lora), "weight_decay": 0.0},
-            {"params": list(head_weight_params),    "lr": float(args.lr_head), "weight_decay": 1e-4},
-            {"params": list(head_scale_params),     "lr": float(args.lr_head), "weight_decay": 0.0},
-            {"params": list(norms),                 "lr": float(args.lr_head) * 0.2, "weight_decay": wd},
-        ]
-        if coarse_head is not None:
-            optim_groups.append(
-                {"params": list(coarse_head.parameters()), "lr": float(args.lr_head), "weight_decay": 1e-4}
-            )
+        group_head_w = take(head_w_ids)
+        group_head_s = take(head_s_ids)
+        group_lora   = take(lora_ids)
+        group_norms  = take(norm_ids)
 
-    # final safety: assert no overlaps
-    seen = set()
-    for gi, g in enumerate(optim_groups):
-        ids = [id(p) for p in g["params"] if p.requires_grad]
-        if any(pid in seen for pid in ids):
-            raise RuntimeError(f"Overlapping params detected in group {gi}")
-        seen.update(ids)
+        if group_lora:
+            groups.append({"params": group_lora,   "lr": float(getattr(args, "lr_lora", 1e-4)), "weight_decay": 0.0})
+        if group_head_w:
+            groups.append({"params": group_head_w, "lr": float(getattr(args, "lr_head", 1e-3)), "weight_decay": 1e-4})
+        if group_head_s:
+            groups.append({"params": group_head_s, "lr": float(getattr(args, "lr_head", 1e-3)), "weight_decay": 0.0})
+        if group_norms:
+            # no-decay for norms
+            groups.append({"params": group_norms,  "lr": float(getattr(args, "lr_head", 1e-3))*0.2, "weight_decay": 0.0})
 
-    return torch.optim.AdamW(optim_groups)
+    # sanity: no overlaps, no unassigned
+    assigned = {id(p) for g in groups for p in g["params"]}
+    unassigned = [p for p in all_trainable if id(p) not in assigned]
+    if unassigned:
+        # should not happen, but fail fast with a clear message
+        na = sum(p.numel() for p in unassigned)
+        raise RuntimeError(f"Unassigned trainable params: {len(unassigned)} tensors ({na} elements). Check grouping logic.")
+
+    # build optimizer
+    opt = torch.optim.AdamW(groups, betas=(0.9, 0.999), eps=1e-8)
+    return opt
+
 
 
 

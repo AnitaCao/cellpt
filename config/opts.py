@@ -10,9 +10,10 @@ def add_common_args(p: argparse.ArgumentParser):
     # dataset / io (not "required" here—validated after config merge)
     p.add_argument("--train_csv", type=str, default=None)
     p.add_argument("--val_csv",   type=str, default=None)
+    
     p.add_argument("--class_map", type=str, default=None)
     p.add_argument("--out_dir",   type=str, default=None)
-    p.add_argument("--use_img_uniform", action="store_true")
+    #p.add_argument("--use_img_uniform", action="store_true")
     p.add_argument("--img_size", type=int, default=224)
     p.add_argument("--use_weighted_sampler", action="store_true",
                     help="Use WeightedRandomSampler for the training DataLoader")
@@ -26,6 +27,8 @@ def add_common_args(p: argparse.ArgumentParser):
                    help="Backbone LR when unfreeze_backbone is set")
     p.add_argument("--use_slide_mask", type=bool, default=False,)
     p.add_argument("--val_style", type=str, default="bal",)
+    
+    p.add_argument("--grad_checkpoint", action="store_true",help="Use gradient checkpointing to save memory")
 
 
     # model / training
@@ -192,7 +195,8 @@ def parse_args(build_fn):
     args = parser.parse_args(remaining)
 
     # Validate required after merge
-    required = ["train_csv", "val_csv", "class_map", "out_dir"]
+    #required = ["train_csv", "val_csv", "class_map", "out_dir"]
+    required = ["class_map", "out_dir"]
     missing = [k for k in required if not getattr(args, k)]
     if missing:
         parser.error(

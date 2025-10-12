@@ -133,6 +133,13 @@ def build_backbone_and_heads(args, classes, num_classes, device):
                     norms += list(m.parameters())
 
     model.to(device)
+    
+    if getattr(args, "grad_checkpoint", 1):
+        try:
+            model.set_grad_checkpointing(True)  # supported by timm Swin/ViT
+            print("[mem] Gradient checkpointing ON")
+        except Exception:
+            pass
 
     # probe pre_logits dim
     with torch.no_grad():
@@ -160,23 +167,23 @@ def build_train_val_datasets(args, class_to_idx, mean, std, label_col):
             csv_a=args.train_csv_view1, csv_b=args.train_csv_view2,
             class_to_idx=class_to_idx, size=args.img_size, mean=mean, std=std,
             label_col=label_col, key_col="cell_id", slide_col="slide_id",
-            augment=True, use_img_uniform=args.use_img_uniform,
+            augment=True, 
         )
         val_ds = PairedMultiFOV(
             csv_a=args.val_csv_view1, csv_b=args.val_csv_view2,
             class_to_idx=class_to_idx, size=args.img_size, mean=mean, std=std,
             label_col=label_col, key_col="cell_id", slide_col="slide_id",
-            augment=False, use_img_uniform=args.use_img_uniform,
+            augment=False, 
         )
     else:
         train_ds = NucleusCSV(
             args.train_csv, class_to_idx, size=args.img_size, mean=mean, std=std,
-            label_col=label_col, use_img_uniform=args.use_img_uniform, augment=True,
+            label_col=label_col, augment=True,
             return_slide=True
         )
         val_ds = NucleusCSV(
             args.val_csv, class_to_idx, size=args.img_size, mean=mean, std=std,
-            label_col=label_col, use_img_uniform=args.use_img_uniform, augment=False,
+            label_col=label_col, augment=False,
             return_slide=True
         )
     return train_ds, val_ds
@@ -185,6 +192,7 @@ def forward_batch(model, x, epoch, args, amp_dtype):
     """
     Shared forward that returns pre_logits and gate_reg.
     x can be [B, 3, H, W] or [B, 2, 3, H, W]
+    """
     """
     if x.ndim == 5:  # multi view packed
         assert hasattr(model, "scale_gate"), "multi-view input detected but model.scale_gate is missing"
@@ -196,6 +204,19 @@ def forward_batch(model, x, epoch, args, amp_dtype):
         pre_logits, gate_reg, g = model.scale_gate(
             P, epoch=epoch, warmup=int(getattr(args, "mv_warmup_epochs", 3))
         )
+    """    
+    if x.ndim == 5:  # x: [B, S, C, H, W]
+        B, S, C, H, W = x.shape
+        pre_list = []
+        for s in range(S):
+            xs = x[:, s].to(dtype=next(model.parameters()).dtype)  # [B,C,H,W]
+            feats_s = model.forward_features(xs)                   # [B, D_in]
+            pre_s = model.forward_head(feats_s, pre_logits=True)   # [B, D]
+            pre_list.append(pre_s)
+        P = torch.stack(pre_list, dim=1)                           # [B,S,D]
+        pre_logits, gate_reg, g = model.scale_gate(
+            P, epoch=epoch, warmup=int(getattr(args, "mv_warmup_epochs", 3))
+        )    
     else:
         x = x.to(dtype=next(model.parameters()).dtype)
         feats = model.forward_features(x)
@@ -211,6 +232,8 @@ def eval_epoch_generic(model, val_loader, device, amp_dtype, adj, args,
     val_total = 0
     val_loss_adj_sum = 0.0
     val_correct_adj = 0
+    val_loss_raw_sum = 0.0
+    val_correct_raw = 0
     all_preds, all_targets = [], []
     with torch.inference_mode(), torch.amp.autocast('cuda', dtype=amp_dtype, enabled=torch.cuda.is_available()):
         for batch in val_loader:
@@ -220,7 +243,18 @@ def eval_epoch_generic(model, val_loader, device, amp_dtype, adj, args,
             y = y.to(device, non_blocking=True)
             pre_logits, _ = forward_batch(model, x, epoch, args, amp_dtype)
             logits = model._cosine_head(pre_logits)
+            
+            
+            #raw (no adj)
+            loss_raw = F.cross_entropy(logits, y)
+            val_loss_raw_sum += loss_raw.item() * y.size(0)
+            c_raw, _ = compute_metrics(logits, y)
+            val_correct_raw += c_raw
+            
+            
+            #effective (adj)
             logits_eff = logits - adj.to(dtype=logits.dtype) if adj is not None else logits
+            
             # optional coarse aux biasing (same as student)
             if bool(getattr(args, "use_coarse_aux", 0)) and hasattr(model, "coarse_head"):
                 eta = float(getattr(args, "hier_alpha", 0.2)) * min(1.0, epoch / max(1, int(getattr(args,"hier_warmup_epochs",3))))
@@ -346,14 +380,6 @@ def replace_classifier_with_cosine(model: nn.Module, num_classes: int, s_init: f
     setattr(model, "_cosine_head", cos_head)
     return cos_head
 
-
-def masked_gt_rate(sids, y, mask):
-    bad = 0
-    for sid, yi in zip(sids, y.tolist()):
-        m = mask.get(sid)
-        if m is not None and not bool(m[yi].item()):
-            bad += 1
-    return bad / max(1, len(y))
 
 def main():
     args = parse_args(lambda p: add_multiview_args(add_lora_args(p)))
@@ -576,13 +602,16 @@ def main():
         else:
             model.coarse_head = nn.Linear(d_embed, len(coarse_classes)).to(device)
             print(f"[coarse] Using Linear head: D={d_embed} -> G={len(coarse_classes)}")
-        # ensure it gets head LR/WD
-        head_weight_params += list(model.coarse_head.parameters())
 
     # Optimizer groups (coarse head gets head lr/WD)
     optimizer = build_optimizer(model, args, lora_params, norms, head_weight_params, head_scale_params)
     
+    for i, g in enumerate(optimizer.param_groups):
+        n = sum(p.numel() for p in g["params"])
+        print(f"[opt] group {i}: n_params={len(g['params'])}, n_elems={n}, lr={g['lr']}, wd={g.get('weight_decay')}")
 
+
+    
     # EMA (track full model)
     ema_model = ModelEmaV2(model, decay=ema_decay, device=device) if ema_on else None
     if ema_model is not None:
@@ -614,7 +643,7 @@ def main():
 
     params_to_clip = [p for g in optimizer.param_groups for p in g['params'] if p.requires_grad]
     
-    early_stopper = MacroF1EarlyStopping(patience=20, min_delta=0.002)
+    early_stopper = MacroF1EarlyStopping(patience=12, min_delta=0.002)
 
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
@@ -769,7 +798,6 @@ def main():
         secs = time.time() - t0
         
         
-
         per_class_metrics = None
         if len(all_preds) > 0:
             per_class_metrics, _, _ = compute_per_class_metrics(all_preds, all_targets, classes)
@@ -1062,6 +1090,7 @@ def train_epoch(model,train_loader,optimizer,
                 total_loss = fine_loss
             else:
                 raise ValueError(f"Unknown loss_type: {args.loss_type}")
+            
             # add small gate regularizer (multi-view only)
             if x.ndim == 5:
                 if isinstance(gate_reg, torch.Tensor):

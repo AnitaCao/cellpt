@@ -282,12 +282,12 @@ def main():
     # ---- Datasets ----
     train_ds = NucleusCSV(
         args.train_csv, class_to_idx, size=args.img_size, mean=mean, std=std,
-        label_col=label_col, use_img_uniform=args.use_img_uniform, augment=True,
+        label_col=label_col, augment=True,
         return_slide=True
     )
     val_ds = NucleusCSV(
         args.val_csv, class_to_idx, size=args.img_size, mean=mean, std=std,
-        label_col=label_col, use_img_uniform=args.use_img_uniform, augment=False,
+        label_col=label_col, augment=False,
         return_slide=True
     )
     
