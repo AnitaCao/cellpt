@@ -27,10 +27,10 @@ def make_targets(counts, train_frac, val_frac):
 def stream_assign(csv_path, out_dir, stem, label_col, allowed, targets, seed):
     rng = np.random.default_rng(seed)
     with open(csv_path, newline='') as f_in, \
-         open(out_dir / f"{stem}_selected_with_splits_fine.csv", "w", newline='') as f_all, \
-         open(out_dir / f"{stem}_selected_train_fine.csv", "w", newline='') as f_tr, \
-         open(out_dir / f"{stem}_selected_val_fine.csv", "w", newline='') as f_va, \
-         open(out_dir / f"{stem}_selected_test_fine.csv", "w", newline='') as f_te:
+         open(out_dir / f"{stem}_selected_with_splits.csv", "w", newline='') as f_all, \
+         open(out_dir / f"{stem}_selected_train.csv", "w", newline='') as f_tr, \
+         open(out_dir / f"{stem}_selected_val.csv", "w", newline='') as f_va, \
+         open(out_dir / f"{stem}_selected_test.csv", "w", newline='') as f_te:
 
         r = csv.DictReader(f_in)
         base_fields = r.fieldnames

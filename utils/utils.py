@@ -648,13 +648,11 @@ def log_to_wandb(wandb_mod, wb_run, epoch: int, base_metrics: dict,
         "time/epoch_sec": base_metrics["epoch_secs"],
     }
     if ema_metrics is not None:
-        log.update({
-            "val_ema/acc_eff":  ema_metrics["val_eff/acc"],
-            "val_ema/loss_eff": ema_metrics["val_eff/loss"],
-            "val_ema/acc_raw":  ema_metrics["val_raw/acc"],
-            "val_ema/loss_raw": ema_metrics["val_raw/loss"],
-            "val_ema/macro_f1": ema_metrics["macro_f1"],
-        })
+        if "val_eff/acc" in ema_metrics:  log["val_ema/acc_eff"]  = ema_metrics["val_eff/acc"]
+        if "val_eff/loss" in ema_metrics: log["val_ema/loss_eff"] = ema_metrics["val_eff/loss"]
+        if "val_raw/acc" in ema_metrics:  log["val_ema/acc_raw"]  = ema_metrics["val_raw/acc"]
+        if "val_raw/loss" in ema_metrics: log["val_ema/loss_raw"] = ema_metrics["val_raw/loss"]
+        if "macro_f1" in ema_metrics:     log["val_ema/macro_f1"] = ema_metrics["macro_f1"]
     if extra:
         log.update(extra)
     try:

@@ -43,8 +43,10 @@ utils/*.csv
 #csv files for combined dataset. will open it later. 
 combined/
 
+notebooks/
+
 #old files, need to delete later
 train_frozen_head.py
 train_lora_ddp.py
 train_lora.py
-train.py
+train.pynotebooks/

@@ -153,6 +153,13 @@ def add_multiview_args(parser):
     g.add_argument("--val_csv_view2",    type=str, default="", help="CSV for 5x   val images")
     g.add_argument("--mv_gate_entropy_w", type=float, default=0.1, help="Entropy reg for gate (decays over warmup)")
     g.add_argument("--mv_warmup_epochs", type=int, default=3, help="Gate entropy warmup length")
+    g.add_argument("--mv_gate_type", type=str, default="scale", choices=["scale","adaptive"])
+    g.add_argument("--mv_gate_entropy_decay_start", type=int, default=4)
+    g.add_argument("--mv_gate_entropy_decay_epochs", type=int, default=4)
+    g.add_argument("--mv_gate_entropy_decay_to", type=float, default=-0.05)
+    g.add_argument("--mv_consistency_w", type=float, default=0.1, help="Consistency loss weight (decays over warmup)")
+    g.add_argument("--mv_consistency_T", type=float, default=0.5, help="Consistency sharpening temperature")
+    g.add_argument("--mv_dropout_p", type=float, default=0.25, help="Dropout prob for MV feature dropout")
     return parser
 
 # -----------------------------

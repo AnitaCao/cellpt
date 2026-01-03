@@ -12,6 +12,7 @@ from torchvision.transforms import InterpolationMode as IM
 import torchvision.transforms.functional as TF
 import random
 import torch.nn as nn
+from dataclasses import dataclass
 
 
 class RandomCenterZoom:
@@ -183,11 +184,18 @@ class PairedMultiFOV(Dataset):
         key_col: str = "cell_id",          # if not in both, will fall back to stem
         slide_col: str = "slide_id",
         augment: bool = False,
+        aug_mode: str = "paired_light", # none|paired_geom_only|paired_light|paired_heavy
+        erase_p: float = 0.0,
+        same_photometric: bool = False, 
     ):
         self.size = int(size)
         self.label_col = label_col
         self.slide_col = slide_col
         self.class_to_idx = class_to_idx
+        self.augment = bool(augment)
+        self.aug_mode = str(aug_mode)
+        self.erase_p = float(erase_p)
+        self.same_photometric = bool(same_photometric)
 
         # Load CSVs
         A = pd.read_csv(csv_a).copy()
@@ -262,11 +270,24 @@ class PairedMultiFOV(Dataset):
         mean = IMAGENET_DEFAULT_MEAN if mean is None else mean
         std  = IMAGENET_DEFAULT_STD  if std  is None else std
 
-        # geometric augments (paired)
-        self.augment = augment
-        self.geo = PairedGeomAug(rot=8, translate=0.05) if augment else None
+        # paired geometric augments (shared across views)
+        self.geo = None
+        self.color = None
+        self.blur = None
 
-        # color + resize + to tensor + norm (apply per-view)
+        if self.augment and self.aug_mode != "none":
+            if self.aug_mode in ("paired_light", "paired_geom_only", "paired_heavy"):
+                self.geo = PairedGeomAug(rot=8, translate=0.05)
+                if self.aug_mode in ("paired_light", "paired_heavy"):
+                    self.color = transforms.ColorJitter(brightness=0.20, contrast=0.20)
+                if self.aug_mode == "paired_heavy":
+                    self.blur = transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0))
+            else:
+                raise ValueError(f"[PairedMultiFOV] Unknown aug_mode='{self.aug_mode}' "
+                                 f"(choices: none | paired_geom_only | paired_light | paired_heavy)")
+
+        # resize + to tensor + normalize (per-view)
+           
         self.post = transforms.Compose([
             transforms.Resize((self.size, self.size), interpolation=IM.BICUBIC, antialias=True),
             transforms.ToTensor(),
@@ -274,8 +295,10 @@ class PairedMultiFOV(Dataset):
             transforms.Normalize(mean, std),
         ])
 
-        # Optional: light color jitter identically to both views (keeps alignment)
-        self.color = transforms.ColorJitter(brightness=0.2, contrast=0.2) if augment else None
+        # Optional shared RandomErasing (applied with the same RNG seed to both views
+        
+        self.use_paired_erasing = self.augment and (aug_mode == "paired_heavy") and (erase_p > 0)
+        self.erase_p = float(erase_p)
 
     def __len__(self):
         return len(self.join)
@@ -292,20 +315,64 @@ class PairedMultiFOV(Dataset):
         ia = Image.open(pa).convert("L")
         ib = Image.open(pb).convert("L")
 
-        # paired geometric augments (keep the two views aligned)
-        if self.augment and self.geo is not None:
+        # ------ paired geometric augments (aligned across views)
+        if self.geo is not None:
             ia, ib = self.geo(ia, ib)
 
-        # optional identical color jitter
-        if self.augment and self.color is not None:
-            # sample once, apply to both by using functional form
-            # ColorJitter doesn't expose sampled params, so we apply the module twice with same seed
-            s = torch.seed()
-            torch.manual_seed(s); ia = self.color(ia)
-            torch.manual_seed(s); ib = self.color(ib)
+        # ------ optional identical color jitter (same sampled params both views)
+        if self.color is not None: 
+            if self.same_photometric:          
+                seed = random.randrange(2**31)  # doesn’t touch torch RNG
+                with torch.random.fork_rng(devices=[]):
+                    torch.manual_seed(seed)
+                    ia = self.color(ia)
+                with torch.random.fork_rng(devices=[]):
+                    torch.manual_seed(seed)
+                    ib = self.color(ib)
+            else:
+                ia = self.color(ia)
+                ib = self.color(ib)
+
+        # ------ optional identical blur (same sampled sigma both views)
+        if self.blur is not None:
+            if self.same_photometric:
+                seed = random.randrange(2**31)  # doesn’t touch torch RNG
+                with torch.random.fork_rng(devices=[]):
+                    torch.manual_seed(seed)
+                    ia = self.blur(ia)
+                with torch.random.fork_rng(devices=[]):
+                    torch.manual_seed(seed)
+                    ib = self.blur(ib)
+            else:
+                ia = self.blur(ia)
+                ib = self.blur(ib)
 
         xa = self.post(ia)  # [C,H,W]
         xb = self.post(ib)  # [C,H,W]
+        
+        
+        # optional identical erasing after normalization (paired_heavy)
+        if self.use_paired_erasing and random.random() < self.erase_p:
+            # simple rectangle ~ torchvision RandomErasing defaults
+            def erase_same_rect(x1, x2):
+                C, H, W = x1.shape
+                area = H * W
+                for _ in range(10):
+                    target = random.uniform(0.02, 0.06) * area
+                    aspect = random.uniform(0.3, 3.3)
+                    h = int(round((target * aspect) ** 0.5))
+                    w = int(round((target / aspect) ** 0.5))
+                    if h < H and w < W:
+                        i = random.randint(0, H - h)
+                        j = random.randint(0, W - w)
+                        val = 0.0
+                        x1[:, i:i+h, j:j+w] = val
+                        x2[:, i:i+h, j:j+w] = val
+                        break
+                return x1, x2
+            xa, xb = erase_same_rect(xa, xb)
+        
+        
         x = torch.stack([xa, xb], dim=0)  # [2,C,H,W]
 
         y = self.class_to_idx[row[f"{self.label_col}_a"]]
@@ -313,8 +380,6 @@ class PairedMultiFOV(Dataset):
         sid = row[slide_a] if slide_a in self.join.columns else ""
 
         return x, y, sid
-
-
 
 
 

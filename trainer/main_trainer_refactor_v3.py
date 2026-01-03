@@ -32,6 +32,8 @@ from utils.utils import (
     compute_coarse_metrics_from_fine,
     save_coarse_confusions_from_fine,
 )
+
+from utils.targeted_aug import ClassAwareAugmenter, PolicyCfg
 from utils.losses import CBFocalLoss, LDAMLoss
 
 from model.lora import apply_lora_to_timm_vit
@@ -51,16 +53,93 @@ class ScaleGate(nn.Module):
             nn.GELU(),
             nn.Linear(h, n_scales)
         )
-    def forward(self, P: torch.Tensor, epoch: int = 0, warmup: int = 3):
+    def forward(self, P: torch.Tensor, epoch: int = 0, warmup: int = 3, entropy_w: float | None = None):
         # P: [B, S, D]
         B, S, D = P.shape
         g = F.softmax(self.net(P.reshape(B, S * D)), dim=-1)   # [B, S]
         fused = torch.sum(P * g.unsqueeze(-1), dim=1)          # [B, D]
         # entropy regularizer (only early)
         H = -(g.clamp_min(1e-8).log() * g).sum(dim=1).mean()
-        w = self.entropy_w0 * max(0.0, 1.0 - min(1.0, epoch / max(1, warmup)))
+        w = self.entropy_w0 if entropy_w is None else float(entropy_w)
         gate_reg = -w * H
+        self.last_g = g.detach()
         return fused, gate_reg, g
+  
+# -----------------------------
+# Multi-view adaptive gate
+# -----------------------------    
+class AdaptiveMultiViewGate(nn.Module):
+    """
+    Specialized gate for 2.5x + 10x fusion.
+    Learns class-specific scale preferences.
+    """
+    def __init__(self, d_embed: int, n_classes: int = 20):
+        super().__init__()
+        self.n = 2
+        
+        # Per-class scale preference prior
+        # Initialize based on single-scale performance
+        self.register_buffer('scale_prior', torch.tensor([
+            # [2.5x_prior, 10x_prior] for each class
+            [0.3, 0.7],  # Astrocytes (10x better)
+            [0.2, 0.8],  # B cells (10x much better: +6.5)
+            [0.7, 0.3],  # T cells (2.5x better: +9.4) ⭐
+            [0.5, 0.5],  # Colon cancer (similar)
+            [0.3, 0.7],  # Endothelial (10x better: +5.5)
+            [0.3, 0.7],  # Epithelial (10x better)
+            [0.7, 0.3],  # Stromal (2.5x better: +14.4) ⭐
+            [0.5, 0.5],  # Fibroblasts (similar)
+            [0.2, 0.8],  # Liver cancer (10x better)
+            [0.4, 0.6],  # Lung cancer (10x better)
+            [0.4, 0.6],  # Stem cells (10x better)
+            [0.5, 0.5],  # Microglia (similar)
+            [0.4, 0.6],  # Myeloid (10x better)
+            [0.7, 0.3],  # NK cells (2.5x better: +11.0) ⭐
+            [0.6, 0.4],  # Neurons (2.5x slightly better)
+            [0.6, 0.4],  # Oligodendrocytes (2.5x better)
+            [0.5, 0.5],  # Ovary cancer (similar)
+            [0.5, 0.5],  # Pancreas cancer (similar)
+            [0.5, 0.5],  # Pericytes (similar)
+            [0.3, 0.7],  # Smooth muscle (10x better)
+        ]))
+        
+        # Learnable gate
+        self.gate = nn.Sequential(
+            nn.LayerNorm(2 * d_embed),
+            nn.Linear(2 * d_embed, 256),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(256, 2)  # 2 scales
+        )
+        
+        self.prior_weight = nn.Parameter(torch.tensor(0.3))  # Learnable prior strength
+    
+    
+    def forward(self, P: torch.Tensor, targets: torch.Tensor = None, epoch: int = 0):
+        # P: [B, 2, D]  (2.5x and 10x features)
+        B, S, D = P.shape
+        
+        # Compute data-driven gate
+        g_data = F.softmax(self.gate(P.reshape(B, S * D)), dim=-1)  # [B, 2]
+        
+        # If training and targets available, blend with class-specific prior
+        if self.training and targets is not None:
+            prior_strength = torch.sigmoid(self.prior_weight)
+            class_priors = self.scale_prior[targets]  # [B, 2]
+            g = (1 - prior_strength) * g_data + prior_strength * class_priors
+            g = F.softmax(g / 0.1, dim=-1)  # Temperature = 0.1
+        else:
+            g = g_data
+        
+        fused = torch.sum(P * g.unsqueeze(-1), dim=1)  # [B, D]
+        
+        # Entropy regularizer (encourage diversity early)
+        H = -(g.clamp_min(1e-8).log() * g).sum(dim=1).mean()
+        w = 0.1 * max(0.0, 1.0 - epoch / 5.0)  # Decay over 5 epochs
+        gate_reg = -w * H
+        
+        return fused, gate_reg, g   
+
 
 # -----------------------------
 # Coarse head (MLP, optional)
@@ -87,9 +166,20 @@ class CoarseHeadMLP(nn.Module):
 # Builders and shared forward
 # -----------------------------
 def build_backbone_and_heads(args, classes, num_classes, device):
-    model = timm.create_model(
-        args.model, pretrained=True, num_classes=num_classes, img_size=args.img_size
-    )
+    
+    create_kwargs = {'pretrained': True, 'num_classes': num_classes}
+    
+    # Only pass img_size for models that accept it
+    model_name_lower = args.model.lower()
+    if any(x in model_name_lower for x in ['vit', 'deit', 'beit', 'swin']):
+        create_kwargs['img_size'] = args.img_size
+    
+    model = timm.create_model(args.model, **create_kwargs)
+    
+    
+    #model = timm.create_model(
+    #    args.model, pretrained=True, num_classes=num_classes, img_size=args.img_size
+    #)
     try:
         mean = tuple(model.pretrained_cfg.get('mean', IMAGENET_DEFAULT_MEAN))
         std  = tuple(model.pretrained_cfg.get('std',  IMAGENET_DEFAULT_STD))
@@ -152,34 +242,59 @@ def build_backbone_and_heads(args, classes, num_classes, device):
 
     # multi view gate
     if int(getattr(args, "multi_view", 0)) == 1:
-        model.scale_gate = ScaleGate(
-            d_embed, n_scales=2, entropy_w=float(getattr(args, "mv_gate_entropy_w", 0.1))
-        ).to(device)
+        gate_type = getattr(args, "mv_gate_type", "scale")  # scale|adaptive    
+        if gate_type == "adaptive":
+            model.scale_gate = AdaptiveMultiViewGate(d_embed, n_classes=num_classes).to(device)
+        else: 
+            model.scale_gate = ScaleGate( d_embed, n_scales=2, entropy_w=float(getattr(args, "mv_gate_entropy_w", 0.1))).to(device)
+        
+        model.mv_tau = nn.Parameter(torch.tensor([1.2, 1.2], device=device))
 
     return model, mean, std, lora_params, norms
 
 
 def build_train_val_datasets(args, class_to_idx, mean, std, label_col):
+    
+    # Decide dataset aug for multi-view vs TAUG
+    enable_taug = int(os.environ.get("ENABLE_TAUG", "1")) == 1
+    mv_ds_aug_mode = os.environ.get("MV_DATASET_AUG_MODE", "auto")  # auto|none|paired_geom_only|paired_light|paired_heavy (multi-view)
+    sv_dataset_aug = os.environ.get("SV_DATASET_AUG", "auto") # auto|on|off (single-view)
+    
     if int(getattr(args, "multi_view", 0)) == 1:
         assert args.train_csv_view1 and args.train_csv_view2 and args.val_csv_view1 and args.val_csv_view2, \
             "multi_view=1 requires train_csv_view1, train_csv_view2, val_csv_view1, val_csv_view2"
+            
+        if mv_ds_aug_mode == "auto":
+            mv_ds_aug_mode = "none" if enable_taug else "paired_light"
+            
         train_ds = PairedMultiFOV(
             csv_a=args.train_csv_view1, csv_b=args.train_csv_view2,
             class_to_idx=class_to_idx, size=args.img_size, mean=mean, std=std,
             label_col=label_col, key_col="cell_id", slide_col="slide_id",
-            augment=True, 
+            augment=(mv_ds_aug_mode != "none"),
+            aug_mode=mv_ds_aug_mode,
+            erase_p=(0.10 if mv_ds_aug_mode == "paired_heavy" else 0.0),
+            same_photometric = False,
         )
         val_ds = PairedMultiFOV(
             csv_a=args.val_csv_view1, csv_b=args.val_csv_view2,
             class_to_idx=class_to_idx, size=args.img_size, mean=mean, std=std,
             label_col=label_col, key_col="cell_id", slide_col="slide_id",
-            augment=False, 
+            augment=False, aug_mode="none", 
+            same_photometric = True,
         )
     else:
+        # single-view: if TAUG is ON, default dataset aug OFF to avoid double-aug
+        if sv_dataset_aug == "auto":
+            sv_aug = (not enable_taug)
+        elif sv_dataset_aug == "on":
+            sv_aug = True
+        else:  # "off"
+            sv_aug = False
+        print(f"[dataset] single-view train augment={sv_aug} (ENABLE_TAUG={int(enable_taug)})")
         train_ds = NucleusCSV(
             args.train_csv, class_to_idx, size=args.img_size, mean=mean, std=std,
-            label_col=label_col, augment=True,
-            return_slide=True
+            label_col=label_col, augment=sv_aug, return_slide=True
         )
         val_ds = NucleusCSV(
             args.val_csv, class_to_idx, size=args.img_size, mean=mean, std=std,
@@ -188,41 +303,69 @@ def build_train_val_datasets(args, class_to_idx, mean, std, label_col):
         )
     return train_ds, val_ds
 
-def forward_batch(model, x, epoch, args, amp_dtype):
-    """
-    Shared forward that returns pre_logits and gate_reg.
-    x can be [B, 3, H, W] or [B, 2, 3, H, W]
-    """
-    """
-    if x.ndim == 5:  # multi view packed
-        assert hasattr(model, "scale_gate"), "multi-view input detected but model.scale_gate is missing"
-        B, S, C, H, W = x.shape
-        xf = x.view(B*S, C, H, W).to(dtype=next(model.parameters()).dtype)
-        feats = model.forward_features(xf)
-        pre_all = model.forward_head(feats, pre_logits=True)   # [B*S, D]
-        P = pre_all.view(B, S, -1)                             # [B,2,D]
-        pre_logits, gate_reg, g = model.scale_gate(
-            P, epoch=epoch, warmup=int(getattr(args, "mv_warmup_epochs", 3))
-        )
-    """    
-    if x.ndim == 5:  # x: [B, S, C, H, W]
+def forward_batch(model, x, epoch, args, amp_dtype, targets=None):
+    if x.ndim == 5:
         B, S, C, H, W = x.shape
         pre_list = []
         for s in range(S):
-            xs = x[:, s].to(dtype=next(model.parameters()).dtype)  # [B,C,H,W]
-            feats_s = model.forward_features(xs)                   # [B, D_in]
-            pre_s = model.forward_head(feats_s, pre_logits=True)   # [B, D]
+            xs = x[:, s].to(dtype=next(model.parameters()).dtype)
+            feats_s = model.forward_features(xs)
+            pre_s = model.forward_head(feats_s, pre_logits=True)
             pre_list.append(pre_s)
-        P = torch.stack(pre_list, dim=1)                           # [B,S,D]
-        pre_logits, gate_reg, g = model.scale_gate(
-            P, epoch=epoch, warmup=int(getattr(args, "mv_warmup_epochs", 3))
-        )    
-    else:
-        x = x.to(dtype=next(model.parameters()).dtype)
-        feats = model.forward_features(x)
-        pre_logits = model.forward_head(feats, pre_logits=True)
-        gate_reg = 0.0
-    return pre_logits, gate_reg
+        P = torch.stack(pre_list, dim=1)
+
+        # gate
+        if isinstance(getattr(model, "scale_gate", None), AdaptiveMultiViewGate):
+            pre_logits, gate_reg, g = model.scale_gate(P, targets=(targets if model.training else None), epoch=epoch)
+        else:
+            ew = get_entropy_weight(epoch, args) if hasattr(args, "mv_gate_entropy_w") else None
+            pre_logits, gate_reg, g = model.scale_gate(P, epoch=epoch,
+                                                       warmup=int(getattr(args, "mv_warmup_epochs", 3)),
+                                                       entropy_w=ew)
+
+        # per-view logits
+        z_list = [model._cosine_head(pre) for pre in pre_list]
+
+        # view dropout (train only)
+        vd_p = float(getattr(args, "mv_dropout_p", 0.25))
+        if model.training and vd_p > 0:
+            u = torch.rand(B, device=z_list[0].device)
+            m0 = (u < (vd_p * 0.5))
+            m1 = (~m0) & (u < vd_p)
+            # Only apply dropout if there are samples to drop
+            if m0.any() or m1.any():
+                # Create one-hot tensors for forced views
+                force_v0 = torch.tensor([[1.0, 0.0]], device=g.device, dtype=g.dtype).expand(B, 2)
+                force_v1 = torch.tensor([[0.0, 1.0]], device=g.device, dtype=g.dtype).expand(B, 2)
+        
+                # Apply masks without in-place operations
+                g = torch.where(m0.unsqueeze(1), force_v0, g)  # Apply view 0 mask
+                g = torch.where(m1.unsqueeze(1), force_v1, g)  # Apply view 1 mask
+
+        # optional force single view
+        force = os.environ.get("MV_FORCE_VIEW", "")
+        if force in ("0", "1"):
+            idx = int(force)
+            g = F.one_hot(torch.full((B,), idx, device=g.device), num_classes=S).to(g.dtype)
+
+        # update last_g to what we actually use
+        if hasattr(model, "scale_gate"):
+            model.scale_gate.last_g = g.detach()
+
+        # temperature-aware fusion (two-view)
+        tau = model.mv_tau if hasattr(model, "mv_tau") else torch.tensor([1.0, 1.0], device=z_list[0].device)
+        tau = tau.clamp(min=0.5, max=4.0)
+        fused_logits = g[:, 0:1] * (z_list[0] / tau[0]) + g[:, 1:2] * (z_list[1] / tau[1])
+
+        aux = {"fused_logits": fused_logits, "z_list": z_list, "g": g}
+        return pre_logits, gate_reg, aux
+
+    # single-view unchanged
+    x = x.to(dtype=next(model.parameters()).dtype)
+    feats = model.forward_features(x)
+    pre_logits = model.forward_head(feats, pre_logits=True)
+    return pre_logits, 0.0, None
+
 
 
 def eval_epoch_generic(model, val_loader, device, amp_dtype, adj, args,
@@ -241,8 +384,8 @@ def eval_epoch_generic(model, val_loader, device, amp_dtype, adj, args,
             else: x, y = batch; sid = None
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
-            pre_logits, _ = forward_batch(model, x, epoch, args, amp_dtype)
-            logits = model._cosine_head(pre_logits)
+            pre_logits, _, aux = forward_batch(model, x, epoch, args, amp_dtype)
+            logits = aux["fused_logits"] if aux is not None else model._cosine_head(pre_logits)
             
             
             #raw (no adj)
@@ -281,6 +424,8 @@ def eval_epoch_generic(model, val_loader, device, amp_dtype, adj, args,
     return {
         "val_eff/acc": (val_correct_adj / max(1, val_total)),
         "val_eff/loss": (val_loss_adj_sum / max(1, val_total)),
+        "val_raw/acc": (val_correct_raw / max(1, val_total)),
+        "val_raw/loss": (val_loss_raw_sum / max(1, val_total)),
         "preds": preds, "targets": targs,
     }
 
@@ -379,6 +524,20 @@ def replace_classifier_with_cosine(model: nn.Module, num_classes: int, s_init: f
     # Save a stable alias; DO NOT overwrite the model's structural 'head' module (e.g., ConvNeXt head)
     setattr(model, "_cosine_head", cos_head)
     return cos_head
+
+def get_entropy_weight(epoch, args):
+    """
+    Decay entropy weight from initial value to target over specified epochs
+    """
+    w0  = float(getattr(args, "mv_gate_entropy_w", 0.10))
+    t0  = int(getattr(args, "mv_gate_entropy_decay_start", 4))
+    dur = int(getattr(args, "mv_gate_entropy_decay_epochs", 4))
+    wT  = float(getattr(args, "mv_gate_entropy_decay_to", -0.05))
+    if epoch < t0: return w0
+    if epoch < t0 + max(1, dur):
+        p = (epoch - t0) / max(1, dur)
+        return w0 * (1 - p) + wT * p
+    return wT
 
 
 def main():
@@ -485,6 +644,52 @@ def main():
         print(f"  {cls:>24}: {int(c):7d} ({pct:5.1f}%)")
         
     
+    # --- Targeted augmentation setup ---
+    enable_taug = int(os.environ.get("ENABLE_TAUG", "1")) == 1  # default ON
+    weak_env = os.environ.get("WEAK_CLASSES", "")  # e.g., "Endothelial cells;Myeloid cells;T cells"
+    
+    if enable_taug:
+        if weak_env.strip():
+            weak_class_names = [s.strip() for s in weak_env.split(";") if s.strip() in class_to_idx]
+        else:
+            # fallback: bottom-3 by frequency
+            idx_sorted = np.argsort(counts_np)
+            weak_class_names = [classes[i] for i in idx_sorted[:3]]
+
+        print(f"[aug] Targeted augmentation ON for: {weak_class_names}")
+
+        augmenter = ClassAwareAugmenter(
+            class_to_idx=class_to_idx,
+            mean=mean, std=std,
+            weak_class_names=weak_class_names,
+            weak_morph=PolicyCfg(p_geom=0.90, p_color=0.35, p_blur=0.35, p_erase=0.30),
+            weak_color=PolicyCfg(p_geom=0.65, p_color=0.85, p_blur=0.30, p_erase=0.25),
+            default_policy=PolicyCfg(p_geom=0.25, p_color=0.10, p_blur=0.05, p_erase=0.10),
+            same_color_across_views=True,
+            same_geom_across_views=True,
+        )
+        augmenter.weak_class_names = list(weak_class_names)
+    else:
+        print("[aug] Targeted augmentation OFF")
+        augmenter = None
+
+    
+    print("\n========== AUGMENTATION CONFIG ==========")
+    print(f"  ENABLE_TAUG:         {enable_taug}")
+    print(f"  MV_DATASET_AUG_MODE: {os.environ.get('MV_DATASET_AUG_MODE', 'auto')}")
+    print(f"  SV_DATASET_AUG:      {os.environ.get('SV_DATASET_AUG', 'auto')}")
+    print(f"  Multi-view mode:     {int(getattr(args, 'multi_view', 0)) == 1}")
+    if int(getattr(args, "multi_view", 0)) == 1:
+        print(f"  → Dataset aug mode:  {train_ds.aug_mode if hasattr(train_ds, 'aug_mode') else 'N/A'}")
+    else:
+        print(f"  → Dataset augment:   {train_ds.augment if hasattr(train_ds, 'augment') else 'N/A'}")
+    print(f"  → TAUG augmenter:    {'Active' if augmenter is not None else 'Disabled'}")
+    if augmenter is not None:
+        print(f"  → Weak classes:      {augmenter.weak_class_names}")
+    print("=========================================\n")
+    
+    
+    
     if args.loss_type in ["cb_focal", "ldam_drw"] and args.sampler == "weighted":
         print("[warning] Switching sampler to UNIFORM because CB-Focal/LDAM-DRW do not pair well with weighted base sampling.")
         args.sampler = "uniform"
@@ -513,7 +718,7 @@ def main():
     #Build slide‑level allowed class bitmasks for constrained inference
     #allowed_bitmask = build_allowed_bitmask(val_ds.df, classes, label_col=label_col, slide_col="slide_id")
     
-    allowed_bitmask = build_allowed_bitmask_from_meta_json(classes, level="fine", subset="subset_all")
+    allowed_bitmask = build_allowed_bitmask_from_meta_json(classes, level="fine", subset="subset_all", json_path="/hpc/group/jilab/rz179/subset_scaled_600k/metadata.json")
 
     print(f"Built context masks for {len(allowed_bitmask)} slides")
 
@@ -556,14 +761,7 @@ def main():
         ldam_loss = LDAMLoss(cls_counts, max_m=args.ldam_max_m, s=args.ldam_s,
                              drw=True, beta=args.cb_beta, drw_start=args.drw_start_epoch).to(device)
 
-    '''
-    # Mixup only with CE
-    if args.loss_type != "ce" and mixup_enabled:
-        print("[loss] Disabling mixup/cutmix since loss_type != 'ce'.")
-        mixup_enabled = False
-        mixup_fn = None
-        soft_ce = None
-    '''
+  
     # Disable LA for non‑CE losses
     if args.loss_type != "ce" and tau_target > 0.0:
         print("[LA] Disabled for non‑CE loss.")
@@ -602,6 +800,9 @@ def main():
         else:
             model.coarse_head = nn.Linear(d_embed, len(coarse_classes)).to(device)
             print(f"[coarse] Using Linear head: D={d_embed} -> G={len(coarse_classes)}")
+            
+    if hasattr(model, "mv_tau"):
+        head_scale_params += [model.mv_tau]  # treat like a scale, no weight decay
 
     # Optimizer groups (coarse head gets head lr/WD)
     optimizer = build_optimizer(model, args, lora_params, norms, head_weight_params, head_scale_params)
@@ -609,7 +810,6 @@ def main():
     for i, g in enumerate(optimizer.param_groups):
         n = sum(p.numel() for p in g["params"])
         print(f"[opt] group {i}: n_params={len(g['params'])}, n_elems={n}, lr={g['lr']}, wd={g.get('weight_decay')}")
-
 
     
     # EMA (track full model)
@@ -643,7 +843,7 @@ def main():
 
     params_to_clip = [p for g in optimizer.param_groups for p in g['params'] if p.requires_grad]
     
-    early_stopper = MacroF1EarlyStopping(patience=12, min_delta=0.002)
+    early_stopper = MacroF1EarlyStopping(patience=8, min_delta=0.002)
 
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
@@ -688,7 +888,8 @@ def main():
             model, train_loader, optimizer, scaler, device, args, epoch,
             mixup_fn, soft_ce, cb_loss, ldam_loss,
             adj, tau_eff, params_to_clip, ema_model, amp_dtype,
-            fine_to_coarse_idx, coarse_classes
+            fine_to_coarse_idx, coarse_classes,
+            augmenter=augmenter,
         )
         train_loss = epoch_stats["loss"]
         train_acc  = epoch_stats["acc"]
@@ -715,6 +916,16 @@ def main():
         val_correct_raw = 0
         val_correct_adj = 0
         all_val_preds, all_val_targets = [], []
+        
+        
+        # Gate usage accumulators
+        gate_sum_cpu = None
+        gate_batches = 0
+        # Per-class accumulators for gate usage
+        #n_scales = getattr(getattr(model, "scale_gate", None), "n", 1)
+        n_scales = 2 if (hasattr(model, "scale_gate") and int(getattr(args, "multi_view", 0)) == 1) else 1
+        gate_sum_by_class = torch.zeros(len(classes), n_scales, dtype=torch.float32)
+        gate_count_by_class = torch.zeros(len(classes), dtype=torch.long)
 
         with torch.inference_mode(), torch.amp.autocast('cuda', dtype=amp_dtype, enabled=torch.cuda.is_available()):
             for batch in val_loader:
@@ -725,9 +936,32 @@ def main():
               
                 x = x.to(device, non_blocking=True)
                 y = y.to(device, non_blocking=True)
-                pre_logits, gate_reg = forward_batch(model, x, epoch, args, amp_dtype)
+                pre_logits, gate_reg, aux = forward_batch(model, x, epoch, args, amp_dtype, targets=None)
+                
+                # Accumulate per-batch and per-class gate diagnostics  -----------Need to refactor to a function. can add this to analysis in paper -----------
+                if x.ndim == 5 and aux is not None and "g" in aux:
+                    g = aux["g"].detach()
+                    B, S = g.shape
+                    
+                    # Verify S matches expected n_scales
+                    assert S == n_scales, f"Gate has {S} scales but expected {n_scales}"
+                    
+                    # Mean over batch for simple epoch mean
+                    g_mean = g.mean(dim=0).cpu()  # [S]
+                    if gate_sum_cpu is None:
+                        gate_sum_cpu = torch.zeros_like(g_mean)
+                    gate_sum_cpu += g_mean
+                    gate_batches += 1
 
-                logits = model._cosine_head(pre_logits)               # [B, K]
+                    # Per-class accumulation: sum g by class, count occurrences
+                    y_cpu = y.detach().to('cpu', dtype=torch.long)
+                    # Index add for each scale to avoid Python loops over classes
+                    for s in range(S):
+                        gate_sum_by_class[:, s].index_add_(0, y_cpu, g[:, s].detach().cpu())
+                    gate_count_by_class.index_add_(0, y_cpu, torch.ones(B, dtype=torch.long))
+                # -----------------------------------------------------------------------------------------------------------------------------------
+
+                logits = aux["fused_logits"] if aux is not None else model._cosine_head(pre_logits)              # [B, K]
                 
                 
                 logits_eff = logits - adj.to(dtype=logits.dtype) if tau_eff > 0 else logits
@@ -929,6 +1163,62 @@ def main():
             "backbone": lr_backbone,
         }
 
+        
+        # Epoch-mean gate usage when multi-view   --------For analysis, can refactor to a function -----------
+        gate_mean = None
+        if gate_batches > 0 and gate_sum_cpu is not None:
+             gate_mean = (gate_sum_cpu / max(1, gate_batches)).tolist()
+             print(f"[mv_gate] epoch {epoch} mean gate = {['%.3f' % v for v in gate_mean]}")
+
+        # Per-class gate summary
+        if gate_count_by_class.sum() > 0:
+            # Avoid div by zero
+            mask = gate_count_by_class > 0
+            gate_mean_by_class = torch.zeros_like(gate_sum_by_class, dtype=torch.float32)
+            gate_mean_by_class[mask] = gate_sum_by_class[mask] / gate_count_by_class[mask].unsqueeze(1).to(torch.float32)
+
+            # Build a small table for printing
+            rows = []
+            for idx, cls in enumerate(classes):
+                n = int(gate_count_by_class[idx].item())
+                if n == 0: 
+                    continue
+                weights = gate_mean_by_class[idx].tolist()  # [S]
+                diff = 0.0
+                if len(weights) >= 2:
+                    diff = abs(weights[0] - weights[1])
+                rows.append((cls, n, weights, diff))
+
+            # Sort by support, then by preference gap
+            rows.sort(key=lambda r: (-r[1], -r[3]))
+
+            # Print top K classes by support (adjust K as you like)
+            K = min(12, len(rows))
+            print("[mv_gate] per-class mean gate weights (top by support)")
+            for cls, n, wts, diff in rows[:K]:
+                w_str = ", ".join(f"{w:.3f}" for w in wts)
+                print(f"  {cls:>24s}  n={n:6d}  [{w_str}]  |Δ|={diff:.3f}")
+
+            # Optional: log a compact dict to W&B
+            if wb_run is not None:
+                try:
+                    # Log only the first two scales for readability
+                    log_dict = {}
+                    for cls, n, wts, diff in rows[:K]:
+                        if len(wts) >= 1:
+                            log_dict[f"mv_gate_cls/{cls}/p0"] = float(wts[0])
+                        if len(wts) >= 2:
+                            log_dict[f"mv_gate_cls/{cls}/p1"] = float(wts[1])
+                        log_dict[f"mv_gate_cls/{cls}/count"] = float(n)
+                    wandb_mod.log(log_dict | {"epoch": epoch}, step=epoch)
+                except Exception:
+                    pass
+                
+        if gate_mean is not None:
+            for i, v in enumerate(gate_mean):
+                base_metrics[f"mv_gate/p{i}"] = float(v)
+        #-----------------------------------------------------------------------------------------------------------------------------------
+        
         log_to_wandb(wandb_mod, wb_run, epoch, base_metrics, ema_metrics, lrs)
 
 
@@ -983,7 +1273,8 @@ def main():
 def train_epoch(model,train_loader,optimizer,
     scaler,device,args,epoch: int,mixup_fn,soft_ce,cb_loss,ldam_loss,adj: torch.Tensor,tau_eff: float,
     params_to_clip,ema_model,amp_dtype: torch.dtype,fine_to_coarse_idx: torch.Tensor = None, 
-    coarse_classes: List[str] = None, ):
+    coarse_classes: List[str] = None,
+    augmenter: ClassAwareAugmenter | None = None,):
     """
     One training epoch with optional coarse auxiliary.
     Returns dict with:
@@ -1024,6 +1315,16 @@ def train_epoch(model,train_loader,optimizer,
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
         y_hard = y.clone()
+        
+        
+        # ---- Targeted augmentation (skip if mixup is active) ----
+        if augmenter is not None:
+            use_mixup = bool(mixup_fn is not None and args.loss_type == "ce"
+                             and epoch <= (int(args.epochs) - max(0, int(getattr(args, 'mixup_off_epochs', 0)))))
+            if not use_mixup:
+                x = augmenter(x, y_hard)
+        
+        
         B = y_hard.size(0)
 
         optimizer.zero_grad(set_to_none=True)
@@ -1031,10 +1332,27 @@ def train_epoch(model,train_loader,optimizer,
             if use_mixup:
                 x, y = mixup_fn(x, y)
                 
-            pre_logits, gate_reg = forward_batch(model, x, epoch, args, amp_dtype)
-            logits = model._cosine_head(pre_logits)                        # [B, K]
+            pre_logits, gate_reg, aux = forward_batch(model, x, epoch, args, amp_dtype, targets=y_hard)
+            if aux is not None and "fused_logits" in aux:
+                logits = aux["fused_logits"]
+                z_list = aux["z_list"]
+            else:
+                logits = model._cosine_head(pre_logits)
             
             logits_eff = logits - adj.to(dtype=logits.dtype) if tau_eff > 0 else logits
+            
+            L_cons, w_cons = 0.0, 0.0
+            if aux is not None and "z_list" in aux:
+                Tcons = float(getattr(args, "mv_consistency_T", 3.0))
+                w_cons0 = float(getattr(args, "mv_consistency_w", 0.10))
+                ramp = min(1.0, max(0, epoch - int(getattr(args, "mv_warmup_epochs", 3))) / 5.0)
+                w_cons = w_cons0 * ramp
+                if w_cons > 0:
+                    z0, z1 = aux["z_list"]
+                    p0 = F.log_softmax(z0 / Tcons, dim=1); q0 = F.softmax(z1 / Tcons, dim=1)
+                    p1 = F.log_softmax(z1 / Tcons, dim=1); q1 = F.softmax(z0 / Tcons, dim=1)
+                    L_cons = (F.kl_div(p0, q0, reduction="batchmean") + F.kl_div(p1, q1, reduction="batchmean")) * (Tcons * Tcons)
+            
 
             # ---- Coarse aux: loss + optional soft gating ----
             # (Requires fine_to_coarse_idx and model.coarse_head to exist)
@@ -1091,10 +1409,13 @@ def train_epoch(model,train_loader,optimizer,
             else:
                 raise ValueError(f"Unknown loss_type: {args.loss_type}")
             
-            # add small gate regularizer (multi-view only)
+            # add consistency + gate_reg
+            if w_cons > 0:
+                total_loss = total_loss + w_cons * L_cons
             if x.ndim == 5:
                 if isinstance(gate_reg, torch.Tensor):
-                    total_loss = total_loss + gate_reg
+                    total_loss = total_loss + gate_reg  # add small gate regularizer (multi-view only)
+
 
         # Backward
         scaler.scale(total_loss).backward()

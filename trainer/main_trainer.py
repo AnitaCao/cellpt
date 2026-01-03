@@ -10,9 +10,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sklearn.metrics import f1_score
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 import timm
+from timm.data import Mixup
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
+from timm.loss import SoftTargetCrossEntropy
 from timm.utils import ModelEmaV2
 
 # project imports (unchanged)
@@ -21,16 +24,7 @@ from data.dataset import NucleusCSV
 from utils.utils import (
     set_seed, compute_metrics,
     init_metrics_logger, log_metrics, compute_per_class_metrics,
-    print_per_class_summary, class_counts_from_df, maybe_init_wandb, 
-    print_confusion_slice, save_confusion_matrices,
-    worker_init_fn, find_group_lr, apply_slide_mask,
-    evaluate_with_mask, log_to_wandb, MacroF1EarlyStopping,
-    detailed_prediction_analysis, build_allowed_bitmask,
-    setup_mixup, create_scheduler, build_optimizer,
-    load_priors_from_csv, compute_logit_prior, tau_at_epoch,
-    build_dataloaders, build_allowed_bitmask_from_meta_json,build_taxonomy_from_meta_json,
-    compute_coarse_metrics_from_fine,
-    save_coarse_confusions_from_fine,
+    print_per_class_summary, class_counts_from_df, maybe_init_wandb, print_confusion_slice, save_confusion_matrices
 )
 from utils.losses import CBFocalLoss, LDAMLoss
 
@@ -53,6 +47,113 @@ class CosineHead(nn.Module):
         w = F.normalize(self.weight, dim=1)
         s = F.softplus(self._s_unconstrained) + 1e-6  # ensure s > 0
         return s * (x @ w.t())
+
+
+def evaluate_with_mask(model,
+                       val_loader,
+                       device,
+                       amp_dtype,
+                       adj,                    # epoch-wise logit adjustment tensor [1,C]
+                       use_slide_mask: bool,
+                       allowed_bitmask: dict,
+                       classes: List[str]):
+    """Run validation with 'effective' path (LA then optional slide mask) + 'raw' diagnostics.
+       Returns dict with val_eff/acc, val_eff/loss, val_raw/acc, val_raw/loss, macro_f1, preds, targets."""
+    model.eval()
+    val_total = 0
+    acc_eff = 0
+    loss_eff_sum = 0.0
+    acc_raw = 0
+    loss_raw_sum = 0.0
+    preds_all, targs_all = [], []
+
+    with torch.inference_mode(), torch.amp.autocast('cuda', dtype=amp_dtype, enabled=torch.cuda.is_available()):
+        for batch in val_loader:
+            if isinstance(batch, (tuple, list)) and len(batch) == 3:
+                x, y, sid_batch = batch
+            else:
+                x, y = batch
+                sid_batch = None
+
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+
+            x = x.to(dtype=next(model.parameters()).dtype)
+            logits = model(x)
+
+            # effective path: LA → mask
+            logits_eff = logits - adj.to(dtype=logits.dtype) if adj is not None else logits
+            if use_slide_mask:
+                logits_eff = apply_slide_mask(logits_eff, sid_batch, allowed_bitmask)
+
+            # effective metrics
+            loss_eff = F.cross_entropy(logits_eff, y)
+            loss_eff_sum += loss_eff.item() * y.size(0)
+            c_eff, n_ = compute_metrics(logits_eff, y)
+            acc_eff += c_eff
+            val_total += n_
+            preds_all.append(logits_eff.argmax(1).cpu())
+            targs_all.append(y.cpu())
+
+            # raw diagnostics
+            loss_raw = F.cross_entropy(logits, y)
+            loss_raw_sum += loss_raw.item() * y.size(0)
+            c_raw, _ = compute_metrics(logits, y)
+            acc_raw += c_raw
+
+    P = torch.cat(preds_all) if preds_all else torch.empty(0, dtype=torch.long)
+    T = torch.cat(targs_all) if targs_all else torch.empty(0, dtype=torch.long)
+    macro_f1 = float(f1_score(T.numpy(), P.numpy(), average="macro", zero_division=0)) if len(P) > 0 else 0.0
+
+    return {
+        "val_eff/acc":  acc_eff / max(1, val_total),
+        "val_eff/loss": loss_eff_sum / max(1, val_total),
+        "val_raw/acc":  acc_raw / max(1, val_total),
+        "val_raw/loss": loss_raw_sum / max(1, val_total),
+        "macro_f1":     macro_f1,
+        "preds":        P.numpy(),
+        "targets":      T.numpy(),
+    }
+
+def log_to_wandb(wandb_mod, wb_run, epoch, base_metrics: dict,
+                 ema_metrics: dict | None,
+                 lrs: dict,
+                 extra: dict | None = None):
+    """Log standard metrics to W&B."""
+    if wb_run is None or wandb_mod is None:
+        return
+    log = {
+        "epoch": epoch,
+        "train/loss": base_metrics["train_loss"],
+        "train/acc": base_metrics["train_acc"],
+        "val/loss_eff": base_metrics["val_loss_eff"],
+        "val/acc_eff": base_metrics["val_acc_eff"],
+        "val/loss_raw": base_metrics["val_loss_raw"],
+        "val/acc_raw": base_metrics["val_acc_raw"],
+        "val/macro_f1": base_metrics["macro_f1"],
+        "la/tau_eff": base_metrics["tau_eff"],
+        "la/label_smoothing": base_metrics["label_smoothing"],
+        "lr/head": lrs.get("head", 0.0),
+        "lr/head_w": lrs.get("head_w", 0.0),
+        "lr/head_s": lrs.get("head_s", 0.0),
+        "lr/lora": lrs.get("lora", 0.0),
+        "lr/backbone": lrs.get("backbone", 0.0),
+        "time/epoch_sec": base_metrics["epoch_secs"],
+    }
+    if ema_metrics is not None:
+        log.update({
+            "val_ema/acc_eff":  ema_metrics["val_eff/acc"],
+            "val_ema/loss_eff": ema_metrics["val_eff/loss"],
+            "val_ema/acc_raw":  ema_metrics["val_raw/acc"],
+            "val_ema/loss_raw": ema_metrics["val_raw/loss"],
+            "val_ema/macro_f1": ema_metrics["macro_f1"],
+        })
+    if extra:
+        log.update(extra)
+    try:
+        wandb_mod.log(log, step=epoch)
+    except Exception:
+        pass
 
 
 def replace_classifier_with_cosine(model: nn.Module, num_classes: int, s_init: float = 30.0) -> CosineHead:
@@ -134,13 +235,60 @@ def replace_classifier_with_cosine(model: nn.Module, num_classes: int, s_init: f
     return cos_head
 
 
-def masked_gt_rate(sids, y, mask):
-    bad = 0
-    for sid, yi in zip(sids, y.tolist()):
-        m = mask.get(sid)
-        if m is not None and not bool(m[yi].item()):
-            bad += 1
-    return bad / max(1, len(y))
+class MacroF1EarlyStopping:
+    def __init__(self, patience: int = 8, min_delta: float = 0.002):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.best_score = -1.0
+        self.counter = 0
+
+    def __call__(self, macro_f1: float) -> bool:
+        if macro_f1 > self.best_score + self.min_delta:
+            self.best_score = macro_f1
+            self.counter = 0
+            return False
+        self.counter += 1
+        if self.counter >= self.patience:
+            print(f"\nEarly stopping: no macro F1 improvement for {self.patience} epochs")
+            return True
+        return False
+
+
+def detailed_prediction_analysis(all_preds: torch.Tensor, all_targets: torch.Tensor,
+                                 classes: List[str], epoch: int):
+    """Every 10 epochs, show prediction vs truth share per class."""
+    if epoch % 10 != 0 or all_preds.numel() == 0:
+        return
+    pred_counts = np.bincount(all_preds.cpu().numpy(), minlength=len(classes))
+    true_counts = np.bincount(all_targets.cpu().numpy(), minlength=len(classes))
+    total_pred, total_true = pred_counts.sum(), true_counts.sum()
+    print("\nPrediction breakdown (every 10 epochs):")
+    print(f"{'Class':<25} {'True %':<8} {'Pred %':<8} {'Ratio':<8} Status")
+    for i, cls in enumerate(classes):
+        tp = (true_counts[i] / total_true * 100.0) if total_true > 0 else 0.0
+        pp = (pred_counts[i] / total_pred * 100.0) if total_pred > 0 else 0.0
+        ratio = (pp / tp) if tp > 0 else 0.0
+        status = "OK" if 0.7 <= ratio <= 1.4 else ("High" if ratio > 1.4 else "Low")
+        print(f"{cls:<25} {tp:<8.1f} {pp:<8.1f} {ratio:<8.2f} {status}")
+
+
+def apply_slide_mask(logits, slide_ids, mask_table):
+    if slide_ids is None:
+        return logits
+    out = logits.clone()
+    neg_inf = torch.finfo(out.dtype).min
+    for i, sid in enumerate(slide_ids):
+        m = mask_table.get(sid, None)
+        if m is None:
+            continue  # unknown slide_id -> do not mask
+        m = m.to(device=out.device)
+        out[i, ~m] = neg_inf
+    return out
+
+
+def is_main_process() -> bool:
+    return True
+
 
 def main():
     args = parse_args(add_lora_args)
@@ -160,10 +308,22 @@ def main():
     smooth_on       = os.environ.get("SMOOTH_SAMPLER", "0") == "1"
     smooth_alpha    = float(os.environ.get("SMOOTH_ALPHA", "0.5"))   # 0.5 ~ sqrt
     epoch_budget    = int(os.environ.get("EPOCH_BUDGET", "0"))
+    downsample_frac = float(os.environ.get("DOWNSAMPLE_HEAD_FRAC", "1.0"))  # e.g., 0.8
     balanced_last_k = int(os.environ.get("BALANCED_LAST_K", "0"))           # e.g., 3
 
+    def _make_worker_init_fn(seed):
+        def _init(worker_id):
+            np.random.seed(seed + worker_id)
+            torch.manual_seed(seed + worker_id)
+        return _init
 
-    worker_init = worker_init_fn(args.seed)
+    def _find_group_lr(optimizer, param_set):
+        for g in optimizer.param_groups:
+            if any(p in param_set for p in g["params"]):
+                return g["lr"]
+        return None
+
+    worker_init = _make_worker_init_fn(args.seed)
 
     set_seed(args.seed)
     torch.set_float32_matmul_precision("high")
@@ -184,13 +344,6 @@ def main():
     idxs = sorted(class_to_idx.values())
     if idxs != list(range(len(idxs))):
         warnings.warn(f"[label-map] Indices are not contiguous 0..{len(idxs)-1}. Got: {idxs[:min(10,len(idxs))]} ...")
-        
-        
-    coarse_classes, coarse_to_idx, fine_to_coarse_idx, fine_to_coarse_name = \
-        build_taxonomy_from_meta_json(classes, subset="subset_all", device=device)
-        
-    print(f"Coarse classes ({len(coarse_classes)}): {coarse_classes}")
-    print(f"Coarse mapping example: {list(fine_to_coarse_name.items())[:]} ...")
 
     # ---- Build model ----
     model = timm.create_model(
@@ -218,8 +371,6 @@ def main():
 
     # Replace classifier with cosine head (backbone-agnostic), then unfreeze head params
     cos_head = replace_classifier_with_cosine(model, num_classes, s_init=30.0)
-    
-    
     assert num_classes == cos_head.weight.size(0), "Head out_dim does not match class map"
     for p in cos_head.parameters():
         p.requires_grad = True
@@ -256,12 +407,6 @@ def main():
                     norms += list(m.parameters())
 
     model.to(device)
-    
-    with torch.no_grad():
-        _probe = torch.randn(2, 3, args.img_size, args.img_size, device=device, dtype=next(model.parameters()).dtype)
-        _out = model(_probe)
-        assert _out.shape[-1] == num_classes, "Cosine head replacement failed; output dims do not match num_classes."
-    
 
     try:
         n_lora = sum(p.numel() for p in lora_params)
@@ -269,11 +414,26 @@ def main():
             print(f"LoRA trainable params: {n_lora}")
     except Exception:
         pass
+
+    # -------- Mixup / CutMix wiring --------
+    mixup_alpha   = float(getattr(args, "mixup_alpha", 0.0))
+    cutmix_alpha  = float(getattr(args, "cutmix_alpha", 0.0))
+    mixup_prob    = float(getattr(args, "mixup_prob", 1.0))
+    mixup_switch  = float(getattr(args, "mixup_switch_prob", 0.0))
+    mixup_mode    = str(getattr(args, "mixup_mode", "batch"))
+    mixup_off_k   = int(getattr(args, "mixup_off_epochs", 10))
+    mixup_enabled = (mixup_alpha > 0.0 or cutmix_alpha > 0.0) 
+    mixup_fn = None
+    soft_ce = None
     
-
-    # -------- Mixup / CutMix wiring --------    
-    mixup_enabled, mixup_fn, soft_ce, mixup_off_k = setup_mixup(args, num_classes)
-
+    if mixup_enabled:
+        mixup_fn = Mixup(
+            mixup_alpha=mixup_alpha, cutmix_alpha=cutmix_alpha,
+            prob=mixup_prob, switch_prob=mixup_switch, mode=mixup_mode,
+            label_smoothing=0.0, num_classes=num_classes
+        )
+        soft_ce = SoftTargetCrossEntropy()
+        print(f"Mixup/CutMix enabled: mixup_alpha={mixup_alpha} cutmix_alpha={cutmix_alpha} ")
 
     label_col = getattr(args, "label_col", "cell_type")
     print(f"Using label column: {label_col}")
@@ -282,12 +442,12 @@ def main():
     # ---- Datasets ----
     train_ds = NucleusCSV(
         args.train_csv, class_to_idx, size=args.img_size, mean=mean, std=std,
-        label_col=label_col, augment=True,
+        label_col=label_col, use_img_uniform=args.use_img_uniform, augment=True,
         return_slide=True
     )
     val_ds = NucleusCSV(
         args.val_csv, class_to_idx, size=args.img_size, mean=mean, std=std,
-        label_col=label_col, augment=False,
+        label_col=label_col, use_img_uniform=args.use_img_uniform, augment=False,
         return_slide=True
     )
     
@@ -304,6 +464,58 @@ def main():
         print(f"Full finetune mode: unfreeze_backbone=1  lr_backbone={args.lr_backbone}")
     print(f"Val samples:   {len(val_ds)}")
     
+    
+     # --- Optional per-class cap to control head/tail ratio (TRAIN only) ---
+    cap_ratio = float(getattr(args, "cap_ratio", 0.0))
+    cap_base  = str(getattr(args, "cap_base", "min"))
+    if cap_ratio > 0.0:
+        vc0 = train_ds.df[label_col].value_counts()
+        counts = np.array([int(vc0.get(c, 0)) for c in classes], dtype=np.int64)
+        nonzero = counts[counts > 0]
+        if nonzero.size == 0:
+            raise RuntimeError("All train class counts are zero after JSON filtering?")
+        if cap_base == "min":
+            base = int(nonzero.min())
+        elif cap_base == "p1":
+            base = int(max(1, math.floor(np.percentile(nonzero, 1))))
+        elif cap_base == "p5":
+            base = int(max(1, math.floor(np.percentile(nonzero, 5))))
+        elif cap_base == "p10":
+            base = int(max(1, math.floor(np.percentile(nonzero, 10))))
+        else:
+            base = int(nonzero.min())
+        cap = int(max(1, math.floor(cap_ratio * base)))
+
+        before = {c: int(vc0.get(c, 0)) for c in classes}
+        capped_parts = []
+        for c in classes:
+            cdf = train_ds.df[train_ds.df[label_col] == c]
+            if len(cdf) > cap:
+                cdf = cdf.sample(cap, random_state=args.seed)
+            capped_parts.append(cdf)
+        train_ds.df = (
+            pd.concat(capped_parts, axis=0)
+              .sample(frac=1.0, random_state=args.seed)
+              .reset_index(drop=True)
+        )
+        vc1 = train_ds.df[label_col].value_counts()
+        after = {c: int(vc1.get(c, 0)) for c in classes}
+        print(f"[cap] Per-class cap active: base={cap_base}({base}) ratio={cap_ratio} → cap={cap}")
+        print(f"[cap] Train size: {sum(before.values())} → {len(train_ds.df)}")
+        for c in classes:
+            if after[c] != before[c]:
+                print(f"  [cap] {c}: {before[c]} → {after[c]}")
+
+    # Optional downsample of the head (largest) class in training only
+    if downsample_frac < 1.0:
+        vc0 = train_ds.df[label_col].value_counts()
+        head_cls = vc0.idxmax()
+        n0 = int(vc0.max())
+        keep = max(1, int(n0 * downsample_frac))
+        head_keep = train_ds.df[train_ds.df[label_col] == head_cls].sample(keep, random_state=args.seed)
+        rest = train_ds.df[train_ds.df[label_col] != head_cls]
+        train_ds.df = pd.concat([head_keep, rest]).sample(frac=1.0, random_state=args.seed).reset_index(drop=True)
+        print(f"[downsample] Head '{head_cls}': {n0} -> {keep} (frac={downsample_frac}) | New train size: {len(train_ds.df)}")
 
     # Show class distribution (aligned to head order)
     counts_np = class_counts_from_df(train_ds.df, label_col=label_col, classes=classes)
@@ -312,49 +524,124 @@ def main():
     for cls, c in zip(classes, counts_np):
         pct = 100.0 * float(c) / float(total)
         print(f"  {cls:>24}: {int(c):7d} ({pct:5.1f}%)")
-        
-    
-    if args.loss_type in ["cb_focal", "ldam_drw"] and args.sampler == "weighted":
-        print("[warning] Switching sampler to UNIFORM because CB-Focal/LDAM-DRW do not pair well with weighted base sampling.")
-        args.sampler = "uniform"
 
     # ---- DataLoaders ----
-    loaders = build_dataloaders(
-        train_ds=train_ds,
-        val_ds=val_ds,
-        args=args,
-        classes=classes,
-        label_col=label_col,
-        worker_init_fn=worker_init,
-        smooth_on=smooth_on,
-        smooth_alpha=smooth_alpha,
-        epoch_budget=epoch_budget,
-        balanced_last_k=balanced_last_k,
-        device=device,
-    )
+    pin = (device.type == "cuda")
+    pw_flag = args.num_workers > 0 and pin
 
-    train_loader_shuffle  = loaders["train_shuffle"]
-    train_loader_weighted = loaders["train_weighted"]
-    train_loader_smooth   = loaders["train_smooth"]
-    balanced_loader       = loaders["train_balanced"]
-    val_loader            = loaders["val"]
+    
+    # UNIFORM (shuffle) base loader
+    train_loader_shuffle = DataLoader(
+        train_ds, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, worker_init_fn=worker_init,
+        pin_memory=pin, persistent_workers=pw_flag, drop_last=True
+    )
+    
+    # WEIGHTED (1/n_c) base loader
+    train_loader_weighted = None
+    if args.sampler == "weighted":
+        vc = train_ds.df[label_col].value_counts()
+        n = np.array([int(vc.get(c, 0)) for c in classes], dtype=np.float64)
+        w_per_class = 1.0 / np.clip(n, 1.0, None)
+        w_map = {c: w_per_class[i] for i, c in enumerate(classes)}
+        w = torch.tensor([w_map[v] for v in train_ds.df[label_col].tolist()], dtype=torch.float32)
+        sampler_w = WeightedRandomSampler(w, num_samples=len(train_ds.df), replacement=True)
+        train_loader_weighted = DataLoader(
+            train_ds, batch_size=args.batch_size, sampler=sampler_w, shuffle=False,
+            num_workers=args.num_workers, worker_init_fn=worker_init,
+            pin_memory=pin, persistent_workers=pw_flag, drop_last=True
+        )
+        print("[sampler] Using WEIGHTED sampler (1/n_c).")
+    else:
+        print("[sampler] Using UNIFORM sampler (shuffle).")
+    
+    val_loader = DataLoader(
+        val_ds, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, worker_init_fn=worker_init,
+        pin_memory=pin, persistent_workers=pw_flag
+    )
     
     #Build slide‑level allowed class bitmasks for constrained inference
-    #allowed_bitmask = build_allowed_bitmask(val_ds.df, classes, label_col=label_col, slide_col="slide_id")
+    slide_to_allowed = (
+        train_ds.df.groupby("slide_id")[label_col]
+        .apply(lambda s: sorted(s.unique().tolist()))
+        .to_dict()
+    )
     
-    allowed_bitmask = build_allowed_bitmask_from_meta_json(classes, level="fine", subset="subset_all")
+    allowed_bitmask = {}
+    
+    for sid, cls_list in slide_to_allowed.items():
+        m = np.zeros(len(classes), dtype=bool)
+        for c in cls_list:
+            m[class_to_idx[c]] = True
+        allowed_bitmask[sid] = torch.from_numpy(m)
 
     print(f"Built context masks for {len(allowed_bitmask)} slides")
 
+    # Power-smoothing sampler
+    if smooth_on :
+        vc = train_ds.df[label_col].value_counts()
+        n = np.array([int(vc.get(c, 0)) for c in classes], dtype=np.float64).clip(1.0, None)
+        w_per_class = n ** (smooth_alpha - 1.0)
+        w_map = {c: w_per_class[i] for i, c in enumerate(classes)}
+        w = torch.tensor([w_map[cell_type] for cell_type in train_ds.df[label_col]], dtype=torch.float32)
+        num_samples = epoch_budget if epoch_budget > 0 else len(train_ds)
+        implied = (n * w_per_class); implied = implied / implied.sum()
+        head_i = int(np.argmax(n)); tail_i = int(np.argmin(n))
+        print(f"Smoothing alpha={smooth_alpha:.2f} implied share  "
+              f"head {classes[head_i]}={implied[head_i]:.4f}  "
+              f"tail {classes[tail_i]}={implied[tail_i]:.4f}  "
+              f"budget={num_samples if epoch_budget>0 else 'full'}")
+        smooth_sampler = WeightedRandomSampler(w, num_samples=num_samples, replacement=True)
+        train_loader_smooth = DataLoader(
+            train_ds, batch_size=args.batch_size, sampler=smooth_sampler, shuffle=False,
+            num_workers=args.num_workers, worker_init_fn=worker_init,
+            pin_memory=pin, persistent_workers=pw_flag, drop_last=True
+        )
+    else:
+        train_loader_smooth = None
+
+    # Optional: balanced sampler for the last K epochs only
+    balanced_loader = None
+    if balanced_last_k > 0:
+        vc = train_ds.df[label_col].value_counts()
+        n = np.array([int(vc.get(c, 0)) for c in classes], dtype=np.float64)
+        w_per_class = 1.0 / np.clip(n, 1.0, None)
+        w_map = {c: w_per_class[i] for i, c in enumerate(classes)}
+        w = torch.tensor([w_map[v] for v in train_ds.df[label_col].tolist()], dtype=torch.float32)
+        sampler_bal = WeightedRandomSampler(w, num_samples=len(train_ds.df), replacement=True)
+        balanced_loader = DataLoader(
+            train_ds, batch_size=args.batch_size, sampler=sampler_bal, shuffle=False,
+            num_workers=args.num_workers, worker_init_fn=worker_init,
+            pin_memory=pin, persistent_workers=pw_flag, drop_last=True
+        )
+        print(f"[sampler] Balanced sampler will be used for the last {balanced_last_k} epochs.")
 
     amp_dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
     scaler = torch.amp.GradScaler('cuda', enabled=(amp_dtype == torch.float16))
 
     # ---- Priors / LA ----
-    prior_counts_np = load_priors_from_csv(getattr(args, "prior_csv", None),
-                                       label_col, class_to_idx, classes, counts_np)
-    _, log_prior = compute_logit_prior(prior_counts_np, device)
+    prior_counts_np = counts_np
+    prior_csv = getattr(args, "prior_csv", None)
+    if prior_csv is not None and str(prior_csv).strip():
+        try:
+            cdf = pd.read_csv(prior_csv)
+            cand_cols = ["img_path_uniform", "img_path"]
+            col = next((c for c in cand_cols if c in cdf.columns), None)
+            if col is None:
+                raise RuntimeError("No image path column found in prior_csv.")
+            cdf = cdf[(cdf[col].map(lambda p: Path(str(p)).is_file()))]
+            cdf = cdf[cdf[label_col].isin(class_to_idx.keys())]
+            vc = cdf[label_col].value_counts()
+            prior_counts_np = np.array([int(vc.get(c, 0)) for c in classes], dtype=np.int64)
+            print(f"Using priors from prior_csv={prior_csv}")
+        except Exception as e:
+            print(f"Warning: failed to read prior_csv ({e}); falling back to train counts.")
+            prior_counts_np = counts_np
 
+    prior = torch.from_numpy(prior_counts_np.astype(np.float64) / max(1, prior_counts_np.sum()))
+    prior = prior.clamp_min(1e-12).to(device=device, dtype=torch.float32)
+    log_prior = torch.log(prior)
 
     early_stop_off = os.environ.get("EARLY_STOP_OFF", "0") == "1"
     tau_target = float(getattr(args, "logit_tau", 1.0))
@@ -375,8 +662,12 @@ def main():
 
 
     # ---- Imbalance-aware loss selection ----
-    cls_counts = counts_np.astype(np.int64) 
-    
+    # Avoid combining weighted base sampling with CB/LDAM
+    if args.loss_type in ["cb_focal", "ldam_drw"] and args.sampler == "weighted":
+        print("[warning] Avoid combining weighted sampler with CB-Focal/LDAM-DRW; switching base sampler to UNIFORM.")
+        args.sampler = "uniform"
+
+    cls_counts = counts_np.astype(np.int64)
     cb_loss = None
     ldam_loss = None
     if args.loss_type == "cb_focal":
@@ -398,8 +689,8 @@ def main():
         print("[LA] Disabled for non‑CE loss.")
         tau_target = 0.0
 
-
-
+    # ---- Optimizer & Scheduler ----
+    # Separate head weight vs temperature s so we can set weight decay on weight only
     head_weight_params, head_scale_params = [], []
     for n, p in getattr(model, "_cosine_head").named_parameters():
         if not p.requires_grad:
@@ -408,21 +699,26 @@ def main():
             head_scale_params.append(p)
         else:
             head_weight_params.append(p)
-            
-    
-    # ---- Coarse aux head (guarded by flag) ----
-    use_coarse_aux = bool(getattr(args, "use_coarse_aux", 0))
-    if use_coarse_aux:
-        with torch.inference_mode():
-            _probe = torch.randn(2, 3, args.img_size, args.img_size,
-                                device=device, dtype=next(model.parameters()).dtype)
-            feats = model.forward_features(_probe)
-        in_dim = feats.shape[-1]
-        model.coarse_head = nn.Linear(in_dim, len(coarse_classes)).to(device)
 
-    # Optimizer groups (coarse head gets head lr/WD)
-    optimizer = build_optimizer(model, args, lora_params, norms, head_weight_params, head_scale_params)
-    
+
+    if unfreeze:
+        # backbone = all trainable params except cosine head
+        head_param_set = set(p for p in getattr(model, "_cosine_head").parameters())
+        backbone_params = [p for p in model.parameters() if p.requires_grad and p not in head_param_set]
+        optim_groups = [
+            {"params": backbone_params,    "lr": args.lr_backbone, "weight_decay": 5e-2},
+            {"params": head_weight_params, "lr": args.lr_head,     "weight_decay": 1e-4},
+            {"params": head_scale_params,  "lr": args.lr_head,     "weight_decay": 0.0},
+        ]
+    else:
+        wd = getattr(args, "weight_decay", 5e-2)
+        optim_groups = [
+            {"params": lora_params,        "lr": args.lr_lora, "weight_decay": 0.0},
+            {"params": head_weight_params, "lr": args.lr_head, "weight_decay": 1e-4},
+            {"params": head_scale_params,  "lr": args.lr_head, "weight_decay": 0.0},
+            {"params": norms,              "lr": args.lr_head * 0.2, "weight_decay": wd},
+        ]
+    optimizer = torch.optim.AdamW(optim_groups)
 
     # EMA (track full model)
     ema_model = ModelEmaV2(model, decay=ema_decay, device=device) if ema_on else None
@@ -430,8 +726,19 @@ def main():
         print(f"[EMA] Enabled (decay={ema_decay}, eval={'EMA' if ema_eval else 'student'})")
 
     # LR scheduler
-    scheduler = create_scheduler(args, optimizer)
+    if args.cosine:
+        total_epochs = args.epochs
+        warmup = max(0, min(args.warmup_epochs, total_epochs - 1))
 
+        def lr_lambda(epoch_idx):
+            if epoch_idx < warmup:
+                return float(epoch_idx + 1) / float(max(1, warmup))
+            progress = (epoch_idx - warmup) / float(max(1, total_epochs - warmup))
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    else:
+        scheduler = None
 
     # Persist class map used
     with open(Path(args.out_dir, "class_to_idx.used.json"), "w") as f:
@@ -454,20 +761,15 @@ def main():
     print(f"LRs: head={args.lr_head}  lora={getattr(args,'lr_lora',0.0)}  | cosine_schedule={args.cosine} warmup={args.warmup_epochs}\n")
 
     params_to_clip = [p for g in optimizer.param_groups for p in g['params'] if p.requires_grad]
-    
-    early_stopper = MacroF1EarlyStopping(patience=20, min_delta=0.002)
 
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
+        model.train()
 
         # Mixup schedule
-        use_mixup_this_epoch = mixup_enabled and args.loss_type == "ce" and (epoch <= (args.epochs - max(0, mixup_off_k)))
+        use_mixup_this_epoch = mixup_enabled and (epoch <= (args.epochs - max(0, mixup_off_k)))
         if mixup_enabled and epoch == 1:
-            print(f"[epoch {epoch}] mixup/cutmix: ON "
-                f"(alpha={getattr(args,'mixup_alpha',0.0)}, "
-                f"cutmix={getattr(args,'cutmix_alpha',0.0)}, "
-                f"prob={getattr(args,'mixup_prob',1.0)}, "
-                f"mode={getattr(args,'mixup_mode','batch')})")
+            print(f"[epoch {epoch}] mixup/cutmix: ON (alpha={mixup_alpha}, cutmix={cutmix_alpha}, prob={mixup_prob}, mode={mixup_mode})")
         if mixup_enabled and epoch == (args.epochs - max(0, mixup_off_k) + 1):
             print(f"[epoch {epoch}] mixup/cutmix: OFF for final {mixup_off_k} epochs")
 
@@ -485,7 +787,11 @@ def main():
             )
 
         # ---- build epoch-wise LA & smoothing ----
-        tau_eff = tau_at_epoch(epoch, la_start_epoch, la_ramp_epochs, tau_target)
+        if epoch < la_start_epoch:
+            tau_eff = 0.0
+        else:
+            prog = min(1.0, max(0.0, (epoch - la_start_epoch + 1) / max(1, la_ramp_epochs)))
+            tau_eff = tau_target * prog
 
         adj = (tau_eff * log_prior).view(1, -1)
         adj = adj - adj.mean()
@@ -495,27 +801,56 @@ def main():
         if epoch <= 3 or epoch % 5 == 0:
             print(f"[epoch {epoch}] tau_eff={tau_eff:.3f}, label_smoothing={label_smoothing:.3f}")
 
+        train_loss_sum = 0.0
+        train_correct = 0
+        train_total = 0
 
-        epoch_stats = train_epoch(
-            model, train_loader, optimizer, scaler, device, args, epoch,
-            mixup_fn, soft_ce, cb_loss, ldam_loss,
-            adj, tau_eff, params_to_clip, ema_model, amp_dtype,
-            fine_to_coarse_idx, coarse_classes
-        )
-        train_loss = epoch_stats["loss"]
-        train_acc  = epoch_stats["acc"]
-        
-        
-        train_fine_loss = epoch_stats.get("fine_loss")
-        train_fine_acc  = epoch_stats.get("fine_acc")
-        train_coarse_acc  = epoch_stats.get("coarse_acc")
-        train_coarse_loss = epoch_stats.get("coarse_loss")
-        train_coarse_loss_w = epoch_stats.get("coarse_loss_w")
-        
-        if train_coarse_acc is not None:
-            print(f"[train] fine_loss {train_fine_loss:.4f} fine_acc {train_fine_acc:.3f} | "
-                f"coarse_loss {train_coarse_loss:.4f} coarse_acc {train_coarse_acc:.3f}")
-        
+        for batch in train_loader:
+            if len(batch) == 3:
+                x, y, sid_batch = batch
+            else:
+                x, y = batch; sid_batch = None
+            
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            x = x.to(dtype=next(model.parameters()).dtype)
+
+            optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=torch.cuda.is_available()):
+                y_hard = y.clone()
+                if use_mixup_this_epoch and mixup_fn is not None:
+                    x, y = mixup_fn(x, y)  # y becomes soft targets
+
+                  
+                logits = model(x)
+                logits_eff = logits - adj.to(dtype=logits.dtype) if tau_eff > 0 else logits
+
+                # ---- Loss switch ----
+                if args.loss_type == "ce":
+                    if use_mixup_this_epoch and soft_ce is not None:
+                        loss = soft_ce(logits_eff, y)  # soft targets
+                    else:
+                        loss = F.cross_entropy(logits_eff, y, label_smoothing=label_smoothing)
+                elif args.loss_type == "cb_focal":
+                    loss = cb_loss(logits_eff, y_hard)
+                elif args.loss_type == "ldam_drw":
+                    loss = ldam_loss(logits_eff, y_hard, epoch=epoch)
+                else:
+                    raise ValueError(f"Unknown loss_type: {args.loss_type}")
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm=5.0)
+            scaler.step(optimizer)
+            scaler.update()
+            if ema_model is not None:
+                ema_model.update(model)
+
+            train_loss_sum += loss.item() * y_hard.size(0)
+            c, t_ = compute_metrics(logits_eff.detach(), y_hard)
+            train_correct += c
+            train_total += t_
+
         if scheduler is not None:
             scheduler.step()
 
@@ -540,28 +875,9 @@ def main():
                 
                 x = x.to(dtype=next(model.parameters()).dtype)
                 
-                feats = model.forward_features(x)                     # [B, D_map or tokens]
-                pre_logits = model.forward_head(feats, pre_logits=True)  # [B, D]
-                logits = model._cosine_head(pre_logits)               # [B, K]
-                
+                logits = model(x)
                 logits_eff = logits - adj.to(dtype=logits.dtype) if tau_eff > 0 else logits
-                
-                if bool(getattr(args, "use_coarse_aux", 0)):
-                    z_coarse = model.coarse_head(pre_logits)          # [B, G]
-                    eta = float(getattr(args, "hier_alpha", 0.2)) * min(1.0, epoch / max(1, int(getattr(args,"hier_warmup_epochs",3))))
-                    if eta > 0.0:
-                        eps = 1e-6
-                        q_coarse_val = F.softmax(z_coarse, dim=1).clamp_min(eps).log()       # [B, G]
-                        ftc = fine_to_coarse_idx.to(device)
-                        if (ftc < 0).any():
-                            ftc = ftc.clone(); ftc[ftc < 0] = 0
-                            bonus = q_coarse_val[:, ftc]; bonus[:, (fine_to_coarse_idx < 0)] = 0.0
-                        else:
-                            bonus = q_coarse_val[:, ftc]
-                        logits_eff = logits_eff + eta * bonus
-                
-                
-                if args.use_slide_mask:    
+                if args.use_slide_mask:
                     logits_eff = apply_slide_mask(logits_eff, sid_batch, allowed_bitmask)
 
                 # Effective metrics (the ones you care about)
@@ -588,23 +904,8 @@ def main():
             all_preds = torch.empty(0, dtype=torch.long)
             all_targets = torch.empty(0, dtype=torch.long)
 
-        # Coarse metrics
-        coarse_metrics, coarse_cm = compute_coarse_metrics_from_fine(
-            all_preds, all_targets, fine_to_coarse_idx, coarse_classes
-        )
-        print(f"[coarse] macro_recall={coarse_metrics['coarse_macro_recall']:.3f}  "
-            f"overall_acc={coarse_metrics['coarse_overall_acc']:.3f}")
-
-        # Optionally save coarse confusions every 10 epochs
-        if epoch % 10 == 0 or epoch == args.epochs:
-            save_coarse_confusions_from_fine(
-                all_targets.numpy(), all_preds.numpy(),
-                coarse_classes, fine_to_coarse_idx,
-                args.out_dir, epoch=epoch,
-                norms=("true", "none", "pred"), print_table_for="true", annotate=True
-            )
-
-   
+        train_loss = train_loss_sum / max(1, train_total)
+        train_acc = train_correct / max(1, train_total)
         val_loss_raw = val_loss_raw_sum / max(1, val_total)
         val_loss_adj = val_loss_adj_sum / max(1, val_total)
         val_acc_raw = val_correct_raw / max(1, val_total)
@@ -678,23 +979,29 @@ def main():
         # ---- EMA eval (optional) ----
         ema_metrics = None
         if ema_model is not None and ema_eval:
+            # backup student
+            student_sd = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+            # EMA weights
+            model.load_state_dict(ema_model.module.state_dict(), strict=False)
             ema_metrics = evaluate_with_mask(
-                ema_model.module, val_loader, device, amp_dtype,
+                model, val_loader, device, amp_dtype,
                 adj=(adj if tau_eff > 0 else None),
                 use_slide_mask=bool(getattr(args, "use_slide_mask", False)),
                 allowed_bitmask=allowed_bitmask,
                 classes=classes
             )
+            # restore student
+            model.load_state_dict({k: v.to(device) for k, v in student_sd.items()}, strict=False)
 
 
         # ---- Logging ----
-        lr_head = find_group_lr(optimizer, set(head_weight_params)) or 0.0
-        lr_lora = find_group_lr(optimizer, set(lora_params) if isinstance(lora_params, list) else set()) or 0.0
+        lr_head = _find_group_lr(optimizer, set(head_weight_params)) or 0.0
+        lr_lora = _find_group_lr(optimizer, set(lora_params) if isinstance(lora_params, list) else set()) or 0.0
         lr_backbone = 0.0
         if unfreeze:
             head_param_set = set(p for p in getattr(model, "_cosine_head").parameters())
             backbone_set = set(p for p in model.parameters() if p.requires_grad and p not in head_param_set)
-            lr_backbone = find_group_lr(optimizer, backbone_set) or 0.0
+            lr_backbone = _find_group_lr(optimizer, backbone_set) or 0.0
 
         log_metrics(
             metrics_w, run_id, epoch, train_loss, train_acc, val_loss_adj, val_acc_adj,
@@ -706,8 +1013,6 @@ def main():
         base_metrics = {
             "train_loss": train_loss,
             "train_acc":  train_acc,
-            "train/fine_loss": train_fine_loss,
-            "train/fine_acc":  train_fine_acc,
             "val_loss_eff": val_loss_adj,   # effective = LA (+mask)
             "val_acc_eff":  val_acc_adj,
             "val_loss_raw": val_loss_raw,
@@ -717,22 +1022,11 @@ def main():
             "label_smoothing": label_smoothing,
             "epoch_secs":   secs,
         }
-        
-        base_metrics["val_coarse/acc"] = coarse_metrics["coarse_overall_acc"]
-        base_metrics["val_coarse/macro_recall"] = coarse_metrics["coarse_macro_recall"]
-        
-        if train_coarse_acc is not None:
-            base_metrics["train_coarse/acc"]   = train_coarse_acc
-        if train_coarse_loss is not None:
-            base_metrics["train_coarse/loss"]  = train_coarse_loss
-        if train_coarse_loss_w is not None:
-            base_metrics["train_coarse/loss_w"] = train_coarse_loss_w
-            
         lrs = {
             "head": lr_head,
-            "head_w": find_group_lr(optimizer, set(head_weight_params)) or 0.0,
-            "head_s": find_group_lr(optimizer, set(head_scale_params)) or 0.0,
-            "lora": find_group_lr(optimizer, set(lora_params) if isinstance(lora_params, list) else set()) or 0.0,
+            "head_w": _find_group_lr(optimizer, set(head_weight_params)) or 0.0,
+            "head_s": _find_group_lr(optimizer, set(head_scale_params)) or 0.0,
+            "lora": _find_group_lr(optimizer, set(lora_params) if isinstance(lora_params, list) else set()) or 0.0,
             "backbone": lr_backbone,
         }
 
@@ -762,18 +1056,13 @@ def main():
                 "best_metric_name": save_by,
                 "best_metric_value": best_metric,
                 "ema": bool(ema_model is not None and metric_src=="ema"),
-                "ema_present": bool(ema_model is not None),
-                "ema_used_for_best": (metric_src == "ema"),
-                "ema_decay": float(ema_decay),  
             }, best_path)
             print(f"  ✓ Saved new best ({save_by}={best_metric:.3f}, from={metric_src}) to {best_path}")
 
         # Early stopping (macro‑F1) — off in your acc‑first runs unless you enable it
         if (not early_stop_off) and (macro_f1 is not None) and (macro_f1==macro_f1):
-            if early_stopper.step(macro_f1):
-                print(f"\nEarly stopping: no macro F1 improvement for {early_stopper.patience} epochs")
+            if MacroF1EarlyStopping(patience=20, min_delta=0.002)(macro_f1):
                 break
-            
 
     if metrics_f is not None:
         metrics_f.close()
@@ -785,182 +1074,6 @@ def main():
 
     print(f"\nDone. Best {save_by}={best_metric:.3f}")
     print(f"Checkpoint: {best_path}")
-    
-    
-def train_epoch(
-    model,
-    train_loader,
-    optimizer,
-    scaler,
-    device,
-    args,
-    epoch: int,
-    mixup_fn,
-    soft_ce,
-    cb_loss,
-    ldam_loss,
-    adj: torch.Tensor,
-    tau_eff: float,
-    params_to_clip,
-    ema_model,
-    amp_dtype: torch.dtype,
-    fine_to_coarse_idx: torch.Tensor = None, 
-    coarse_classes: List[str] = None, 
-):
-    """
-    One training epoch with optional coarse auxiliary.
-    Returns dict with:
-      - total loss/acc
-      - fine loss/acc
-      - coarse loss/acc (if enabled)
-    """
-    model.train()
-
-    # running sums
-    total_loss_sum = 0.0
-    fine_loss_sum  = 0.0
-    fine_correct   = 0
-    fine_total     = 0
-
-    coarse_loss_sum    = 0.0   # unweighted CE over masked examples
-    coarse_loss_w_sum  = 0.0   # weighted contribution (beta warmup applied)
-    coarse_correct     = 0
-    coarse_total       = 0
-
-    mixup_off_k = int(getattr(args, "mixup_off_epochs", 0))
-    use_mixup = bool(mixup_fn is not None and args.loss_type == "ce"
-                     and epoch <= (int(args.epochs) - max(0, mixup_off_k)))
-
-    use_coarse_aux = bool(getattr(args, "use_coarse_aux", 0))
-    beta  = float(getattr(args, "coarse_loss_weight", 0.3))
-    warm  = int(getattr(args, "hier_warmup_epochs", 3))
-    eta0  = float(getattr(args, "hier_alpha", 0.2))
-    w_coarse = beta * min(1.0, epoch / max(1, warm))
-    eta      = eta0 * min(1.0, epoch / max(1, warm))
-
-    for batch in train_loader:
-        if len(batch) >= 2:
-            x, y = batch[:2]
-        else:
-            raise RuntimeError("train_loader must yield (x, y, [slide_id])")
-
-        x = x.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
-        y_hard = y.clone()
-        B = y_hard.size(0)
-
-        optimizer.zero_grad(set_to_none=True)
-        with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=torch.cuda.is_available()):
-            # Mixup (soft targets)
-            if use_mixup:
-                x, y = mixup_fn(x, y)
-
-            # Forward to fine logits and apply LA
-            feats = model.forward_features(x) # [B, D_map or tokens]
-            pre_logits = model.forward_head(feats, pre_logits=True)  # [B, D]
-            logits = model._cosine_head(pre_logits)               # [B, K]
-            
-            logits_eff = logits - adj.to(dtype=logits.dtype) if tau_eff > 0 else logits
-
-            # ---- Coarse aux: loss + optional soft gating ----
-            # (Requires fine_to_coarse_idx and model.coarse_head to exist)
-            if use_coarse_aux and hasattr(model, "coarse_head"):
-                z_coarse = model.coarse_head(pre_logits)          # [B, G]
-                # map fine labels -> coarse labels
-                y_coarse = fine_to_coarse_idx[y_hard]        # [B]
-                mask = (y_coarse >= 0)
-
-                if mask.any():
-                    # a) coarse CE with warm-up weight
-                    L_coarse = F.cross_entropy(z_coarse[mask], y_coarse[mask])
-                    # we add only the weighted contribution to the total loss
-                    # but we log both weighted and unweighted
-                    loss_coarse_w = w_coarse * L_coarse
-                    # b) soft gating on fine logits (bias toward coarse posterior)
-                    if eta > 0.0:
-                        eps = 1e-6
-                        log_qc = F.softmax(z_coarse, dim=1).clamp_min(eps).log()   # [B, G]
-                        ftc = fine_to_coarse_idx
-                        if (ftc < 0).any():
-                            ftc = ftc.clone(); ftc[ftc < 0] = 0
-                            bonus = log_qc[:, ftc]                                  # [B, K]
-                            bonus[:, (fine_to_coarse_idx < 0)] = 0.0
-                        else:
-                            bonus = log_qc[:, ftc]
-                        logits_eff = logits_eff + eta * bonus
-                else:
-                    # no mapped samples in this batch
-                    L_coarse = None
-                    loss_coarse_w = None
-            else:
-                L_coarse = None
-                loss_coarse_w = None
-
-            # ---- Fine loss (after optional gating) ----
-            if args.loss_type == "ce":
-                if use_mixup and soft_ce is not None:
-                    fine_loss = soft_ce(logits_eff, y)  # soft labels
-                else:
-                    ls = float(getattr(args, "label_smoothing", 0.0))
-                    fine_loss = F.cross_entropy(logits_eff, y, label_smoothing=ls)
-                total_loss = fine_loss + (loss_coarse_w if loss_coarse_w is not None else 0.0)
-            elif args.loss_type == "cb_focal":
-                if cb_loss is None:
-                    raise ValueError("CB-Focal requested but cb_loss is None")
-                fine_loss = cb_loss(logits_eff, y_hard)
-                total_loss = fine_loss  # we don't combine coarse with focal by default
-            elif args.loss_type == "ldam_drw":
-                if ldam_loss is None:
-                    raise ValueError("LDAM-DRW requested but ldam_loss is None")
-                fine_loss = ldam_loss(logits_eff, y_hard, epoch=epoch)
-                total_loss = fine_loss
-            else:
-                raise ValueError(f"Unknown loss_type: {args.loss_type}")
-
-        # Backward
-        scaler.scale(total_loss).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm=5.0)
-        scaler.step(optimizer)
-        scaler.update()
-        if ema_model is not None:
-            ema_model.update(model)
-
-        # ---- Accumulate metrics ----
-        # total & fine
-        total_loss_sum += float(total_loss.item()) * B
-        fine_loss_sum  += float(fine_loss.item())  * B
-        c, t_ = compute_metrics(logits_eff.detach(), y_hard)
-        fine_correct += c
-        fine_total   += t_
-
-        # coarse
-        if use_coarse_aux and L_coarse is not None and mask.any():
-            # L_coarse is mean over masked subset
-            m = int(mask.sum().item())
-            coarse_loss_sum   += float(L_coarse.item())    * m
-            coarse_loss_w_sum += float((loss_coarse_w if loss_coarse_w is not None else 0.0).item()) * m
-            pred_c = z_coarse.detach().argmax(1)
-            coarse_correct += int((pred_c[mask] == y_coarse[mask]).sum().item())
-            coarse_total   += m
-
-    # Averages
-    out = {
-        "loss":            total_loss_sum / max(1, fine_total),
-        "acc":             fine_correct   / max(1, fine_total),
-        "samples":         fine_total,
-        "fine_loss":       fine_loss_sum  / max(1, fine_total),
-        "fine_acc":        fine_correct   / max(1, fine_total),
-    }
-    if use_coarse_aux:
-        out.update({
-            "coarse_loss":      (coarse_loss_sum   / max(1, coarse_total)) if coarse_total > 0 else None,
-            "coarse_loss_w":    (coarse_loss_w_sum / max(1, coarse_total)) if coarse_total > 0 else None,
-            "coarse_acc":       (coarse_correct    / max(1, coarse_total)) if coarse_total > 0 else None,
-            "coarse_samples":   coarse_total,
-        })
-    return out
-
 
 
 if __name__ == "__main__":
