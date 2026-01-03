@@ -1,0 +1,13 @@
+{
+    "apoptotic_body": 0,
+    "ductal_epithelium": 1,
+    "fibroblast": 2,
+    "lymphocyte": 3,
+    "macrophage": 4,
+    "mitotic_figure": 5,
+    "myoepithelium": 6,
+    "neutrophil": 7,
+    "plasma_cell": 8,
+    "tumor": 9,
+    "vascular_endothelium": 10
+}
